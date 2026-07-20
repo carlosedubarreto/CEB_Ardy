@@ -1,0 +1,72 @@
+bl_info = {
+    "name": "CEB Ardy",
+    "author": "Carlos Barreto",
+    "version": (1, 1, 0),
+    "blender": (4, 4, 0),
+    "location": "3D Viewport > Sidebar (N-panel) > CEB",
+    "description": "Integrate NVIDIA ARDY real-time motion generation framework into Blender",
+    "category": "Animation",
+}
+
+### - List of prompts
+### - add waypoints
+### - add constraints
+
+import bpy
+from bpy.props import StringProperty
+
+# Support reloading submodules
+if "bpy" in locals():
+    import importlib
+    if "panel" in locals():
+        importlib.reload(panel)
+    if "operator" in locals():
+        importlib.reload(operator)
+
+from . import panel
+from . import operator
+
+class CEB_Ardy_Preferences(bpy.types.AddonPreferences):
+    bl_idname = __package__ if __package__ else "CEB_Ardy"
+
+    ardy_path: StringProperty(
+        name="Portable Python Folder",
+        description="Select the portable Python folder (the 'ardy' folder should be a sibling)",
+        subtype='DIR_PATH',
+        default=""
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        column = layout.column(align=True)
+        column.prop(self, "ardy_path")
+        
+        # Add some quick help/status in preferences
+        if not self.ardy_path:
+            column.label(text="Please select the portable Python folder.", icon='ERROR')
+        else:
+            from .operator import get_ardy_paths
+            paths, err = get_ardy_paths(context)
+            if err:
+                column.label(text=err, icon='WARNING')
+            else:
+                column.label(text="Python and ARDY detected successfully!", icon='CHECKMARK')
+
+classes = (
+    CEB_Ardy_Preferences,
+)
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    operator.register()
+    panel.register()
+
+def unregister():
+    panel.unregister()
+    operator.unregister()
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+if __name__ == "__main__":
+    register()
