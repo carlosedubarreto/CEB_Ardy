@@ -49,6 +49,168 @@ def send_waypoints_to_bridge(context=None):
     except Exception as e:
         print(f"[CEB Ardy] Error sending waypoints over socket: {e}")
 
+def blender_pos_to_ardy(pos_b, scale=1.0):
+    return [float(pos_b[0]) / scale, float(pos_b[2]) / scale, float(pos_b[1]) / scale]
+
+def blender_rot_to_ardy(R_b):
+    return [
+        [float(R_b[0][0]), float(R_b[0][2]), float(R_b[0][1])],
+        [float(R_b[2][0]), float(R_b[2][2]), float(R_b[2][1])],
+        [float(R_b[1][0]), float(R_b[1][2]), float(R_b[1][1])],
+    ]
+
+# ARDY joint name orderings (must appear before send_pose_constraints_to_bridge)
+_soma30_names = [
+    'Hips', 'Spine1', 'Spine2', 'Chest', 'Neck1', 'Neck2', 'Head', 'Jaw', 'LeftEye', 'RightEye',
+    'LeftShoulder', 'LeftArm', 'LeftForeArm', 'LeftHand', 'LeftHandThumbEnd', 'LeftHandMiddleEnd',
+    'RightShoulder', 'RightArm', 'RightForeArm', 'RightHand', 'RightHandThumbEnd', 'RightHandMiddleEnd',
+    'LeftLeg', 'LeftShin', 'LeftFoot', 'LeftToeBase', 'RightLeg', 'RightShin', 'RightFoot', 'RightToeBase'
+]
+_smpl24_names = [
+    'Pelvis', 'L_Hip', 'R_Hip', 'Spine1', 'L_Knee', 'R_Knee', 'Spine2', 'L_Ankle', 'R_Ankle', 'Spine3',
+    'L_Foot', 'R_Foot', 'Neck', 'L_Collar', 'R_Collar', 'Head', 'L_Shoulder', 'R_Shoulder',
+    'L_Elbow', 'R_Elbow', 'L_Wrist', 'R_Wrist', 'L_Hand', 'R_Hand'
+]
+_smpl22_names = _smpl24_names[:22]
+
+def remove_pose_constraint_armature(item):
+    obj_name = getattr(item, "pose_armature_name", "")
+    if obj_name:
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception as e:
+                print(f"[CEB Ardy] Error removing pose constraint armature: {e}")
+
+    base_name = f"ARDY_Pose_F{item.start_frame}"
+    for obj in list(bpy.data.objects):
+        if obj.type == 'ARMATURE' and (obj.name == base_name or obj.name.startswith(f"{base_name}_")):
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+
+    item.pose_armature_name = ""
+
+def get_or_create_pose_constraint_armature(context, item):
+    obj_name = getattr(item, "pose_armature_name", "")
+    obj = bpy.data.objects.get(obj_name) if obj_name else None
+
+    if not obj:
+        char_arm = None
+        if context.active_object and context.active_object.type == 'ARMATURE' and not context.active_object.name.startswith("ARDY_Pose_"):
+            char_arm = context.active_object
+        else:
+            for candidate in ["Core_Armature", "SOMA_Armature"]:
+                candidate_obj = bpy.data.objects.get(candidate)
+                if candidate_obj:
+                    char_arm = candidate_obj
+                    break
+        if not char_arm:
+            for o in context.scene.objects:
+                if o.type == 'ARMATURE' and not o.name.startswith("ARDY_Pose_"):
+                    char_arm = o
+                    break
+
+        if not char_arm:
+            print("[CEB Ardy] No character armature found to duplicate for pose constraint.")
+            return None
+
+        base_name = f"ARDY_Pose_F{item.start_frame}"
+        obj_name = base_name
+        idx = 1
+        while bpy.data.objects.get(obj_name):
+            obj_name = f"{base_name}_{idx}"
+            idx += 1
+
+        arm_data_copy = char_arm.data.copy()
+        arm_data_copy.name = f"{obj_name}_Data"
+        arm_data_copy.display_type = 'STICK'
+        obj = bpy.data.objects.new(obj_name, arm_data_copy)
+        obj.matrix_world = char_arm.matrix_world.copy()
+        obj.show_in_front = True
+        obj.display_type = 'WIRE'
+
+        col_name = "ARDY_PoseConstraints"
+        collection = bpy.data.collections.get(col_name)
+        if not collection:
+            collection = bpy.data.collections.new(col_name)
+            context.scene.collection.children.link(collection)
+        collection.objects.link(obj)
+
+        item.pose_armature_name = obj.name
+
+    return obj
+
+def send_pose_constraints_to_bridge(context=None):
+    global _realtime_client, _realtime_running
+    if not _realtime_client or not _realtime_running:
+        return
+    if context is None:
+        context = bpy.context
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return
+    props = context.scene.ceb_ardy
+    scale = props.import_scale
+    try:
+        _realtime_client.sendall(b"CLEAR_POSE_CONSTRAINTS\n")
+        import json
+        for item in props.prompt_schedule:
+            if item.enabled and getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
+                arm_obj = bpy.data.objects.get(item.pose_armature_name)
+                if not arm_obj:
+                    continue
+
+                bone_names = [b.name for b in arm_obj.pose.bones]
+                num_bones = len(bone_names)
+
+                # Determine ARDY joint name order for this skeleton
+                if num_bones == 30:
+                    joint_order = _soma30_names
+                elif num_bones == 24:
+                    joint_order = _smpl24_names
+                elif num_bones == 22:
+                    joint_order = _smpl22_names
+                else:
+                    # Fallback: use Blender's own bone order
+                    joint_order = bone_names
+
+                joints_pos = []
+                joints_rot = []
+                for jname in joint_order:
+                    bone = arm_obj.pose.bones.get(jname)
+                    if bone is None:
+                        # Bone not found: output identity/zero
+                        joints_pos.append([0.0, 0.0, 0.0])
+                        joints_rot.append([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+                        continue
+
+                    mat_world = arm_obj.matrix_world @ bone.matrix
+                    head_loc = mat_world.to_translation()
+                    rot_mat = mat_world.to_3x3()
+
+                    pos_a = blender_pos_to_ardy(head_loc, scale=scale)
+                    rot_a = blender_rot_to_ardy(rot_mat)
+
+                    joints_pos.append(pos_a)
+                    joints_rot.append(rot_a)
+
+                pos_json = json.dumps(joints_pos)
+                rot_json = json.dumps(joints_rot)
+                cmd = f"POSE_CONSTRAINT:{item.start_frame}:{pos_json}:{rot_json}\n"
+                _realtime_client.sendall(cmd.encode("utf-8"))
+    except Exception as e:
+        print(f"[CEB Ardy] Error sending pose constraints over socket: {e}")
+
+def update_has_pose_constraint(self, context):
+    tag_redraw_view3d(context)
+    if getattr(self, "has_pose_constraint", False):
+        get_or_create_pose_constraint_armature(context, self)
+    else:
+        remove_pose_constraint_armature(self)
+    send_pose_constraints_to_bridge(context)
+
 def remove_waypoint_empty(item):
     obj_name = getattr(item, "waypoint_object_name", "")
     if obj_name:
@@ -81,6 +243,7 @@ def update_has_waypoint(self, context):
 def update_prompt_item(self, context):
     tag_redraw_view3d(context)
     send_waypoints_to_bridge(context)
+    send_pose_constraints_to_bridge(context)
 
 def update_overlay_visibility(self, context):
     tag_redraw_view3d(context)
@@ -130,6 +293,17 @@ class CEB_Ardy_PromptItem(bpy.types.PropertyGroup):
     waypoint_object_name: bpy.props.StringProperty(
         name="Empty Object Name",
         description="Name of the Blender Empty object linked to this waypoint",
+        default=""
+    )
+    has_pose_constraint: bpy.props.BoolProperty(
+        name="Has Pose Constraint",
+        description="Whether this entry has a full-body pose constraint attached",
+        default=False,
+        update=update_has_pose_constraint
+    )
+    pose_armature_name: bpy.props.StringProperty(
+        name="Pose Armature Name",
+        description="Name of the duplicated ghost armature object used for pose constraints",
         default=""
     )
 
@@ -240,10 +414,12 @@ class CEB_OT_RemovePromptItem(bpy.types.Operator):
         if 0 <= idx < len(props.prompt_schedule):
             item = props.prompt_schedule[idx]
             remove_waypoint_empty(item)
+            remove_pose_constraint_armature(item)
             props.prompt_schedule.remove(idx)
             props.prompt_schedule_index = max(0, idx - 1)
             tag_redraw_view3d(context)
             send_waypoints_to_bridge(context)
+            send_pose_constraints_to_bridge(context)
         return {'FINISHED'}
 
 class CEB_OT_ClearPromptItems(bpy.types.Operator):
@@ -258,11 +434,13 @@ class CEB_OT_ClearPromptItems(bpy.types.Operator):
         props = context.scene.ceb_ardy
         for item in props.prompt_schedule:
             remove_waypoint_empty(item)
+            remove_pose_constraint_armature(item)
         props.prompt_schedule.clear()
         props.prompt_schedule_index = 0
         tag_redraw_view3d(context)
         send_waypoints_to_bridge(context)
-        self.report({'INFO'}, "Cleared all prompt schedule items and waypoints.")
+        send_pose_constraints_to_bridge(context)
+        self.report({'INFO'}, "Cleared all prompt schedule items and constraints.")
         return {'FINISHED'}
 
 class CEB_OT_MovePromptItem(bpy.types.Operator):
@@ -307,6 +485,8 @@ class CEB_OT_SortPromptItems(bpy.types.Operator):
                 "has_waypoint": item.has_waypoint,
                 "waypoint_co": mathutils.Vector(item.waypoint_co),
                 "waypoint_object_name": item.waypoint_object_name,
+                "has_pose_constraint": getattr(item, "has_pose_constraint", False),
+                "pose_armature_name": getattr(item, "pose_armature_name", ""),
             })
 
         items_data.sort(key=lambda x: x["start_frame"])
@@ -320,10 +500,13 @@ class CEB_OT_SortPromptItems(bpy.types.Operator):
             new_item.has_waypoint = d["has_waypoint"]
             new_item.waypoint_co = d["waypoint_co"]
             new_item.waypoint_object_name = d["waypoint_object_name"]
+            new_item.has_pose_constraint = d["has_pose_constraint"]
+            new_item.pose_armature_name = d["pose_armature_name"]
 
         props.prompt_schedule_index = 0
         tag_redraw_view3d(context)
         send_waypoints_to_bridge(context)
+        send_pose_constraints_to_bridge(context)
         self.report({'INFO'}, "Prompt schedule reordered by start frame.")
         return {'FINISHED'}
 
@@ -344,6 +527,51 @@ class CEB_OT_RemoveWaypoint(bpy.types.Operator):
             self.report({'INFO'}, "Waypoint removed.")
         return {'FINISHED'}
 
+class CEB_OT_AddPoseConstraint(bpy.types.Operator):
+    bl_idname = "ceb.add_pose_constraint"
+    bl_label = "Add Pose Constraint"
+    bl_description = "Add a full-body pose constraint by duplicating the character armature for target posing"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        item = props.prompt_schedule.add()
+        item.start_frame = 0 if len(props.prompt_schedule) == 1 else context.scene.frame_current
+        item.prompt = ""
+        item.has_pose_constraint = True
+
+        arm_obj = get_or_create_pose_constraint_armature(context, item)
+
+        props.prompt_schedule_index = len(props.prompt_schedule) - 1
+        tag_redraw_view3d(context)
+        send_pose_constraints_to_bridge(context)
+
+        if arm_obj:
+            bpy.ops.object.select_all(action='DESELECT')
+            arm_obj.select_set(True)
+            context.view_layer.objects.active = arm_obj
+            self.report({'INFO'}, f"Added Pose Constraint armature '{arm_obj.name}' at frame {item.start_frame}")
+        else:
+            self.report({'WARNING'}, "Added Pose Constraint item, but no character armature was found to duplicate.")
+
+        return {'FINISHED'}
+
+class CEB_OT_RemovePoseConstraint(bpy.types.Operator):
+    bl_idname = "ceb.remove_pose_constraint"
+    bl_label = "Remove Pose Constraint"
+    bl_description = "Remove full-body Pose Constraint target and delete linked ghost armature object"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        idx = props.prompt_schedule_index
+        if 0 <= idx < len(props.prompt_schedule):
+            item = props.prompt_schedule[idx]
+            remove_pose_constraint_armature(item)
+            item.has_pose_constraint = False
+            tag_redraw_view3d(context)
+            send_pose_constraints_to_bridge(context)
+            self.report({'INFO'}, "Pose constraint removed.")
+        return {'FINISHED'}
+
 class CEB_OT_SelectPromptItem(bpy.types.Operator):
     bl_idname = "ceb.select_prompt_item"
     bl_label = "Select Prompt Item"
@@ -360,9 +588,15 @@ class CEB_OT_SelectPromptItem(bpy.types.Operator):
             # Jump timeline cursor to start frame
             context.scene.frame_set(item.start_frame)
             
-            # Select linked Empty object in 3D View if present
+            # Select linked Empty object or Pose Armature in 3D View if present
             if getattr(item, "has_waypoint", False) and getattr(item, "waypoint_object_name", ""):
                 obj = bpy.data.objects.get(item.waypoint_object_name)
+                if obj:
+                    bpy.ops.object.select_all(action='DESELECT')
+                    obj.select_set(True)
+                    context.view_layer.objects.active = obj
+            elif getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
+                obj = bpy.data.objects.get(item.pose_armature_name)
                 if obj:
                     bpy.ops.object.select_all(action='DESELECT')
                     obj.select_set(True)
@@ -1264,18 +1498,17 @@ class CEB_OT_CleanAnimation(bpy.types.Operator):
 
     def execute(self, context):
         target_arms = []
-        
-        # 1. Check active object first
+        # 1. Check active object first (excluding pose constraint ghost armatures)
         active = context.active_object
-        if active and active.type == 'ARMATURE':
+        if active and active.type == 'ARMATURE' and not active.name.startswith("ARDY_Pose_"):
             target_arms.append(active)
             
         # 2. Check selected objects
         for obj in context.selected_objects:
-            if obj.type == 'ARMATURE' and obj not in target_arms:
+            if obj.type == 'ARMATURE' and not obj.name.startswith("ARDY_Pose_") and obj not in target_arms:
                 target_arms.append(obj)
                 
-        # 3. If no armature selected, fall back to canonical ARDY armatures in scene
+        # 3. If no character armature selected, fall back to canonical ARDY character armatures in scene
         if not target_arms:
             for arm_name in ["Core_Armature", "SOMA_Armature"]:
                 arm_obj = bpy.data.objects.get(arm_name)
@@ -1488,6 +1721,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             initial_cmd = f"MODEL:{props.model}\nPROMPT:{active_prompt}\nFRAME:{current_frame}\n"
             _realtime_client.sendall(initial_cmd.encode("utf-8"))
             send_waypoints_to_bridge(context)
+            send_pose_constraints_to_bridge(context)
         except Exception as e:
             self.report({'ERROR'}, f"Connection failed: {e}. Is the Bridge Process running?")
             _realtime_client = None
@@ -1601,6 +1835,8 @@ classes = (
     CEB_OT_AddPromptItem,
     CEB_OT_AddWaypoint,
     CEB_OT_RemoveWaypoint,
+    CEB_OT_AddPoseConstraint,
+    CEB_OT_RemovePoseConstraint,
     CEB_OT_SelectPromptItem,
     CEB_OT_RemovePromptItem,
     CEB_OT_ClearPromptItems,

@@ -11,6 +11,10 @@ class CEB_UL_PromptList(bpy.types.UIList):
                 row.label(text="Waypoint", icon='ORIENTATION_LOCAL')
                 op = row.operator("ceb.select_prompt_item", text="", icon='RESTRICT_SELECT_OFF', emboss=False)
                 op.index = index
+            elif getattr(item, "has_pose_constraint", False):
+                row.label(text="Pose Constraint", icon='ARMATURE_DATA')
+                op = row.operator("ceb.select_prompt_item", text="", icon='RESTRICT_SELECT_OFF', emboss=False)
+                op.index = index
             else:
                 row.prop(item, "prompt", text="", emboss=True)
                 op = row.operator("ceb.select_prompt_item", text="", icon='RESTRICT_SELECT_OFF', emboss=False)
@@ -111,6 +115,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         col = row.column(align=True)
         col.operator("ceb.add_prompt_item", text="", icon='ADD')
         col.operator("ceb.add_waypoint", text="", icon='ORIENTATION_LOCAL')
+        col.operator("ceb.add_pose_constraint", text="", icon='ARMATURE_DATA')
         col.operator("ceb.remove_prompt_item", text="", icon='REMOVE')
         col.operator("ceb.clear_prompt_items", text="", icon='TRASH')
         col.separator()
@@ -119,18 +124,24 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         col.operator("ceb.move_prompt_item", text="", icon='TRIA_UP').direction = 'UP'
         col.operator("ceb.move_prompt_item", text="", icon='TRIA_DOWN').direction = 'DOWN'
 
-        # Selected Prompt / Waypoint Details Box
+        # Selected Prompt / Waypoint / Pose Details Box
         if 0 <= props.prompt_schedule_index < len(props.prompt_schedule):
             selected_item = props.prompt_schedule[props.prompt_schedule_index]
             wp_box = box.box()
-            wp_row = wp_box.row(align=True)
-            wp_row.prop(selected_item, "has_waypoint", text="3D Waypoint Target")
             if selected_item.has_waypoint:
+                wp_row = wp_box.row(align=True)
+                wp_row.prop(selected_item, "has_waypoint", text="3D Waypoint Target")
                 wp_row.operator("ceb.remove_waypoint", text="", icon='X')
                 loc_row = wp_box.row(align=True)
                 loc_row.prop(selected_item, "waypoint_co", text="Location")
                 if selected_item.waypoint_object_name:
                     wp_box.label(text=f"Linked Empty: {selected_item.waypoint_object_name}", icon='EMPTY_DATA')
+            elif getattr(selected_item, "has_pose_constraint", False):
+                pc_row = wp_box.row(align=True)
+                pc_row.prop(selected_item, "has_pose_constraint", text="Pose Constraint Target")
+                pc_row.operator("ceb.remove_pose_constraint", text="", icon='X')
+                if selected_item.pose_armature_name:
+                    wp_box.label(text=f"Target Armature: {selected_item.pose_armature_name}", icon='POSE_HLT')
 
 classes = (
     CEB_UL_PromptList,

@@ -13,7 +13,7 @@ bl_info = {
 ###        OK - Esta demorando muito para poder agir, tentar ajustar para ser mais rapido
 ### OK - clear animation (blender e blender bridge)
 ### OK - add waypoints
-### - add constraints
+### OK- add constraints
 
 import bpy
 from bpy.props import StringProperty
