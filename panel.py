@@ -69,6 +69,11 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         row.prop(props, "realtime_port", text="Port")
         
         box.prop(props, "model", text="Model")
+        box.prop(props, "quantize_4bit", text="4-bit Quantization (VRAM Save)")
+        
+        row = box.row(align=True)
+        row.prop(props, "realtime_recording", text="Record Animation")
+        row.operator("ceb.clean_animation", text="Clean Animation", icon='TRASH')
         
         row = box.row(align=True)
         row.scale_y = 1.1
@@ -81,8 +86,6 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         
         if props.realtime_status == "Connected":
             box.prop(props, "realtime_prompt")
-            row = box.row()
-            row.prop(props, "realtime_recording", text="Record Animation")
 
         # --- Prompt Schedule ---
         box = layout.box()
@@ -101,6 +104,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         col = row.column(align=True)
         col.operator("ceb.add_prompt_item", text="", icon='ADD')
         col.operator("ceb.remove_prompt_item", text="", icon='REMOVE')
+        col.operator("ceb.clear_prompt_items", text="", icon='TRASH')
         col.separator()
         col.operator("ceb.move_prompt_item", text="", icon='TRIA_UP').direction = 'UP'
         col.operator("ceb.move_prompt_item", text="", icon='TRIA_DOWN').direction = 'DOWN'

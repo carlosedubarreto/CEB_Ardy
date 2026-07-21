@@ -8,7 +8,10 @@ bl_info = {
     "category": "Animation",
 }
 
-### - List of prompts
+### OK - 4 bit quantization
+### OK - List of prompts
+###         - Esta demorando muito para poder agir, tentar ajustar para ser mais rapido
+### OK - clear animation (blender e blender bridge)
 ### - add waypoints
 ### - add constraints
 

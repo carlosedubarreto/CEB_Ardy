@@ -6,6 +6,7 @@ import math
 import mathutils
 import gpu
 import blf
+import socket
 from gpu_extras.batch import batch_for_shader
 from bpy.app.handlers import persistent
 
@@ -16,6 +17,7 @@ except ImportError:
 
 _realtime_client = None
 _realtime_running = False
+_active_stream_operator = None
 _overlay_draw_handler = None
 
 def tag_redraw_view3d(context=None):
@@ -43,7 +45,7 @@ class CEB_Ardy_PromptItem(bpy.types.PropertyGroup):
     start_frame: bpy.props.IntProperty(
         name="Start Frame",
         description="Frame number when this prompt starts running",
-        default=1,
+        default=0,
         min=0,
         update=update_prompt_item
     )
@@ -63,6 +65,17 @@ def update_realtime_prompt(self, context):
         except Exception as e:
             print(f"[CEB Ardy] Failed to send prompt over socket: {e}")
 
+def get_active_prompt_for_frame(props, frame):
+    if hasattr(props, "prompt_schedule") and len(props.prompt_schedule) > 0:
+        sorted_schedule = sorted(props.prompt_schedule, key=lambda x: x.start_frame)
+        active_prompt = None
+        for item in sorted_schedule:
+            if item.enabled and frame >= item.start_frame:
+                active_prompt = item.prompt
+        if active_prompt:
+            return active_prompt
+    return props.realtime_prompt if props.realtime_prompt else "walk"
+
 class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     model: bpy.props.EnumProperty(
         name="Model",
@@ -72,6 +85,11 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
             ('soma', "SOMA", "SOMA 77-joint skeleton")
         ],
         default='core'
+    )
+    quantize_4bit: bpy.props.BoolProperty(
+        name="4-bit Quantization (bitsandbytes)",
+        description="Load text encoder in 4-bit precision to save GPU VRAM (~5.5 GB VRAM instead of ~16 GB)",
+        default=True
     )
     import_scale: bpy.props.FloatProperty(
         name="Import Scale",
@@ -112,7 +130,7 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     show_prompt_overlay: bpy.props.BoolProperty(
         name="Show Overlay in 3D View",
         description="Display real-time prompt overlay in 3D Viewport",
-        default=True,
+        default=False,
         update=update_overlay_visibility
     )
 
@@ -124,7 +142,10 @@ class CEB_OT_AddPromptItem(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.ceb_ardy
         item = props.prompt_schedule.add()
-        item.start_frame = context.scene.frame_current
+        if len(props.prompt_schedule) == 1:
+            item.start_frame = 0
+        else:
+            item.start_frame = context.scene.frame_current
         item.prompt = "walk"
         props.prompt_schedule_index = len(props.prompt_schedule) - 1
         tag_redraw_view3d(context)
@@ -142,6 +163,22 @@ class CEB_OT_RemovePromptItem(bpy.types.Operator):
             props.prompt_schedule.remove(idx)
             props.prompt_schedule_index = max(0, idx - 1)
             tag_redraw_view3d(context)
+        return {'FINISHED'}
+
+class CEB_OT_ClearPromptItems(bpy.types.Operator):
+    bl_idname = "ceb.clear_prompt_items"
+    bl_label = "Clear All Prompts"
+    bl_description = "Remove all items from the prompt schedule"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        props.prompt_schedule.clear()
+        props.prompt_schedule_index = 0
+        tag_redraw_view3d(context)
+        self.report({'INFO'}, "Cleared all prompt schedule items.")
         return {'FINISHED'}
 
 class CEB_OT_MovePromptItem(bpy.types.Operator):
@@ -891,6 +928,91 @@ class CEB_OT_ArdyImportNPZ(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         return import_ardy_npz(self.filepath, context, self)
 
+class CEB_OT_CleanAnimation(bpy.types.Operator):
+    bl_idname = "ceb.clean_animation"
+    bl_label = "Clean Animation"
+    bl_description = "Clear all keyframes and animation data from the selected ARDY character armature"
+
+    def execute(self, context):
+        target_arms = []
+        
+        # 1. Check active object first
+        active = context.active_object
+        if active and active.type == 'ARMATURE':
+            target_arms.append(active)
+            
+        # 2. Check selected objects
+        for obj in context.selected_objects:
+            if obj.type == 'ARMATURE' and obj not in target_arms:
+                target_arms.append(obj)
+                
+        # 3. If no armature selected, fall back to canonical ARDY armatures in scene
+        if not target_arms:
+            for arm_name in ["Core_Armature", "SOMA_Armature"]:
+                arm_obj = bpy.data.objects.get(arm_name)
+                if arm_obj and arm_obj not in target_arms:
+                    target_arms.append(arm_obj)
+
+        if not target_arms:
+            self.report({'WARNING'}, "No ARDY character armature selected or found in scene.")
+            return {'CANCELLED'}
+
+        for arm_obj in target_arms:
+            if arm_obj.animation_data:
+                arm_obj.animation_data_clear()
+            if arm_obj.pose:
+                for b in arm_obj.pose.bones:
+                    b.location = (0, 0, 0)
+                    b.rotation_quaternion = (1, 0, 0, 0)
+                    b.rotation_euler = (0, 0, 0)
+                    b.scale = (1, 1, 1)
+
+            # Reset armature object-level position & transform
+            arm_obj.location = (0, 0, 0)
+            arm_obj.rotation_euler = (0, 0, 0)
+            arm_obj.scale = (1, 1, 1)
+
+            # Reset parent empty position & transform if attached
+            if arm_obj.parent:
+                arm_obj.parent.location = (0, 0, 0)
+                arm_obj.parent.rotation_euler = (0, 0, 0)
+                arm_obj.parent.scale = (1, 1, 1)
+
+        context.scene.frame_current = 1
+        tag_redraw_view3d(context)
+
+        # Clear queued frames from realtime stream operator if running
+        global _active_stream_operator
+        CEB_OT_ArdyRealtimeStream._frame_queue = []
+        if _active_stream_operator is not None:
+            _active_stream_operator._frame_queue = []
+            _active_stream_operator._buffer = ""
+
+        # Send RESET signal to real-time bridge server if connected or reachable
+        global _realtime_client, _realtime_running
+        sent = False
+        if _realtime_client and _realtime_running:
+            try:
+                _realtime_client.sendall(b"RESET\n")
+                sent = True
+            except Exception as e:
+                print(f"[CEB Ardy] Failed to send RESET command over socket: {e}")
+
+        if not sent:
+            props = context.scene.ceb_ardy
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(("127.0.0.1", props.realtime_port))
+                s.sendall(b"RESET\n")
+                s.close()
+            except Exception:
+                pass
+
+        arm_names = ", ".join([o.name for o in target_arms])
+        self.report({'INFO'}, f"Cleaned animation data & reset bridge position for: {arm_names}")
+        return {'FINISHED'}
+
 class CEB_OT_ArdyStartBridge(bpy.types.Operator):
     bl_idname = "ceb.ardy_start_bridge"
     bl_label = "Start Bridge Process"
@@ -908,13 +1030,17 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
             return {'CANCELLED'}
 
         props = context.scene.ceb_ardy
+        cmd = [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", props.model]
+        if props.quantize_4bit:
+            cmd.append("--quantize-4bit")
+
         try:
             subprocess.Popen(
-                [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", props.model],
+                cmd,
                 cwd=paths["ardy_dir"],
                 creationflags=0x00000010  # CREATE_NEW_CONSOLE
             )
-            self.report({'INFO'}, "Starting ARDY real-time bridge...")
+            self.report({'INFO'}, f"Starting ARDY real-time bridge{' (4-bit quantization)' if props.quantize_4bit else ''}...")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to start bridge process: {e}")
             return {'CANCELLED'}
@@ -967,6 +1093,20 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 self.cleanup(context)
                 return {'CANCELLED'}
 
+            # Check for prompt schedule updates for current frame
+            props = context.scene.ceb_ardy
+            current_frame = context.scene.frame_current
+            active_prompt = get_active_prompt_for_frame(props, current_frame)
+            if hasattr(self, "_last_sent_prompt") and self._last_sent_prompt != active_prompt:
+                try:
+                    props.realtime_prompt = active_prompt
+                    prompt_cmd = f"PROMPT:{active_prompt}\n"
+                    _realtime_client.sendall(prompt_cmd.encode("utf-8"))
+                    self._last_sent_prompt = active_prompt
+                    print(f"[CEB Ardy Stream] Prompt updated at frame {current_frame} → '{active_prompt}'")
+                except Exception as pe:
+                    print(f"[CEB Ardy Stream] Error sending prompt update: {pe}")
+
             # 2. Process frames from the unimported motion data buffer
             if self._frame_queue:
                 # Dynamic catch-up if buffer builds up significantly (> 20 or > 40 frames)
@@ -988,7 +1128,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
     def execute(self, context):
-        global _realtime_client, _realtime_running
+        global _realtime_client, _realtime_running, _active_stream_operator
         props = context.scene.ceb_ardy
 
         if _realtime_running:
@@ -1004,18 +1144,25 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             _realtime_client.connect(("127.0.0.1", props.realtime_port))
             _realtime_client.setblocking(False)
             _realtime_running = True
+            _active_stream_operator = self
             props.realtime_status = "Connected"
             
             self._buffer = ""
             self._frame_queue = []
             
-            # Send initial model and prompt
-            initial_cmd = f"MODEL:{props.model}\nPROMPT:{props.realtime_prompt}\n"
+            current_frame = context.scene.frame_current
+            active_prompt = get_active_prompt_for_frame(props, current_frame)
+            props.realtime_prompt = active_prompt
+            self._last_sent_prompt = active_prompt
+
+            # Send initial model, prompt, and current frame in Blender
+            initial_cmd = f"MODEL:{props.model}\nPROMPT:{active_prompt}\nFRAME:{current_frame}\n"
             _realtime_client.sendall(initial_cmd.encode("utf-8"))
         except Exception as e:
             self.report({'ERROR'}, f"Connection failed: {e}. Is the Bridge Process running?")
             _realtime_client = None
             _realtime_running = False
+            _active_stream_operator = None
             self._buffer = ""
             self._frame_queue = None
             props.realtime_status = "Disconnected"
@@ -1026,7 +1173,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def cleanup(self, context):
-        global _realtime_client, _realtime_running
+        global _realtime_client, _realtime_running, _active_stream_operator
         props = context.scene.ceb_ardy
         
         if self._timer is not None:
@@ -1044,6 +1191,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         self._buffer = ""
         self._frame_queue = None
         _realtime_running = False
+        _active_stream_operator = None
         props.realtime_status = "Disconnected"
         self.report({'INFO'}, "ARDY stream disconnected.")
 
@@ -1122,10 +1270,12 @@ classes = (
     CEB_Ardy_SceneProperties,
     CEB_OT_AddPromptItem,
     CEB_OT_RemovePromptItem,
+    CEB_OT_ClearPromptItems,
     CEB_OT_MovePromptItem,
     CEB_OT_ArdyRunServer,
     CEB_OT_ArdyRunDemo,
     CEB_OT_ArdyImportNPZ,
+    CEB_OT_CleanAnimation,
     CEB_OT_ArdyStartBridge,
     CEB_OT_ArdyRealtimeStream,
 )
