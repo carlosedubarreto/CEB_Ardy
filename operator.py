@@ -19,6 +19,7 @@ _realtime_client = None
 _realtime_running = False
 _active_stream_operator = None
 _overlay_draw_handler = None
+_3d_draw_handler = None
 
 def tag_redraw_view3d(context=None):
     if context is None:
@@ -29,11 +30,68 @@ def tag_redraw_view3d(context=None):
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
 
+def send_waypoints_to_bridge(context=None):
+    global _realtime_client, _realtime_running
+    if not _realtime_client or not _realtime_running:
+        return
+    if context is None:
+        context = bpy.context
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return
+    props = context.scene.ceb_ardy
+    try:
+        _realtime_client.sendall(b"CLEAR_WAYPOINTS\n")
+        for item in props.prompt_schedule:
+            if item.enabled and getattr(item, "has_waypoint", False):
+                co = item.waypoint_co
+                cmd = f"WAYPOINT:{item.start_frame}:{co[0]:.4f}:{co[1]:.4f}:{co[2]:.4f}\n"
+                _realtime_client.sendall(cmd.encode("utf-8"))
+    except Exception as e:
+        print(f"[CEB Ardy] Error sending waypoints over socket: {e}")
+
+def remove_waypoint_empty(item):
+    obj_name = getattr(item, "waypoint_object_name", "")
+    if obj_name:
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception as e:
+                print(f"[CEB Ardy] Error removing waypoint empty: {e}")
+
+    # Fallback search for any Empty object matching ARDY_Waypoint_F<start_frame>
+    base_name = f"ARDY_Waypoint_F{item.start_frame}"
+    for obj in list(bpy.data.objects):
+        if obj.type == 'EMPTY' and (obj.name == base_name or obj.name.startswith(f"{base_name}_")):
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+
+    item.waypoint_object_name = ""
+
+def update_has_waypoint(self, context):
+    tag_redraw_view3d(context)
+    if getattr(self, "has_waypoint", False):
+        get_or_create_waypoint_empty(context, self)
+    else:
+        remove_waypoint_empty(self)
+    send_waypoints_to_bridge(context)
+
 def update_prompt_item(self, context):
     tag_redraw_view3d(context)
+    send_waypoints_to_bridge(context)
 
 def update_overlay_visibility(self, context):
     tag_redraw_view3d(context)
+
+def update_waypoint_co(self, context):
+    tag_redraw_view3d(context)
+    if getattr(self, "has_waypoint", False) and getattr(self, "waypoint_object_name", ""):
+        obj = bpy.data.objects.get(self.waypoint_object_name)
+        if obj and (obj.location - mathutils.Vector(self.waypoint_co)).length > 1e-4:
+            obj.location = self.waypoint_co
+    send_waypoints_to_bridge(context)
 
 class CEB_Ardy_PromptItem(bpy.types.PropertyGroup):
     prompt: bpy.props.StringProperty(
@@ -55,6 +113,25 @@ class CEB_Ardy_PromptItem(bpy.types.PropertyGroup):
         default=True,
         update=update_prompt_item
     )
+    has_waypoint: bpy.props.BoolProperty(
+        name="Has Waypoint",
+        description="Whether this prompt entry has a 3D Waypoint location target attached",
+        default=False,
+        update=update_has_waypoint
+    )
+    waypoint_co: bpy.props.FloatVectorProperty(
+        name="Waypoint Location",
+        description="3D world location vector (X, Y, Z) for this waypoint",
+        subtype='TRANSLATION',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        update=update_waypoint_co
+    )
+    waypoint_object_name: bpy.props.StringProperty(
+        name="Empty Object Name",
+        description="Name of the Blender Empty object linked to this waypoint",
+        default=""
+    )
 
 def update_realtime_prompt(self, context):
     global _realtime_client
@@ -71,7 +148,8 @@ def get_active_prompt_for_frame(props, frame):
         active_prompt = None
         for item in sorted_schedule:
             if item.enabled and frame >= item.start_frame:
-                active_prompt = item.prompt
+                if item.prompt and item.prompt.strip() and not getattr(item, "has_waypoint", False):
+                    active_prompt = item.prompt
         if active_prompt:
             return active_prompt
     return props.realtime_prompt if props.realtime_prompt else "walk"
@@ -160,9 +238,12 @@ class CEB_OT_RemovePromptItem(bpy.types.Operator):
         props = context.scene.ceb_ardy
         idx = props.prompt_schedule_index
         if 0 <= idx < len(props.prompt_schedule):
+            item = props.prompt_schedule[idx]
+            remove_waypoint_empty(item)
             props.prompt_schedule.remove(idx)
             props.prompt_schedule_index = max(0, idx - 1)
             tag_redraw_view3d(context)
+            send_waypoints_to_bridge(context)
         return {'FINISHED'}
 
 class CEB_OT_ClearPromptItems(bpy.types.Operator):
@@ -175,10 +256,13 @@ class CEB_OT_ClearPromptItems(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.ceb_ardy
+        for item in props.prompt_schedule:
+            remove_waypoint_empty(item)
         props.prompt_schedule.clear()
         props.prompt_schedule_index = 0
         tag_redraw_view3d(context)
-        self.report({'INFO'}, "Cleared all prompt schedule items.")
+        send_waypoints_to_bridge(context)
+        self.report({'INFO'}, "Cleared all prompt schedule items and waypoints.")
         return {'FINISHED'}
 
 class CEB_OT_MovePromptItem(bpy.types.Operator):
@@ -203,6 +287,189 @@ class CEB_OT_MovePromptItem(bpy.types.Operator):
         tag_redraw_view3d(context)
         return {'FINISHED'}
 
+class CEB_OT_SortPromptItems(bpy.types.Operator):
+    bl_idname = "ceb.sort_prompt_items"
+    bl_label = "Sort Schedule by Frame"
+    bl_description = "Reorder prompt schedule items chronologically by start frame"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        schedule = props.prompt_schedule
+        if len(schedule) <= 1:
+            return {'FINISHED'}
+
+        items_data = []
+        for item in schedule:
+            items_data.append({
+                "prompt": item.prompt,
+                "start_frame": item.start_frame,
+                "enabled": item.enabled,
+                "has_waypoint": item.has_waypoint,
+                "waypoint_co": mathutils.Vector(item.waypoint_co),
+                "waypoint_object_name": item.waypoint_object_name,
+            })
+
+        items_data.sort(key=lambda x: x["start_frame"])
+
+        schedule.clear()
+        for d in items_data:
+            new_item = schedule.add()
+            new_item.prompt = d["prompt"]
+            new_item.start_frame = d["start_frame"]
+            new_item.enabled = d["enabled"]
+            new_item.has_waypoint = d["has_waypoint"]
+            new_item.waypoint_co = d["waypoint_co"]
+            new_item.waypoint_object_name = d["waypoint_object_name"]
+
+        props.prompt_schedule_index = 0
+        tag_redraw_view3d(context)
+        send_waypoints_to_bridge(context)
+        self.report({'INFO'}, "Prompt schedule reordered by start frame.")
+        return {'FINISHED'}
+
+class CEB_OT_RemoveWaypoint(bpy.types.Operator):
+    bl_idname = "ceb.remove_waypoint"
+    bl_label = "Remove Waypoint"
+    bl_description = "Remove 3D Waypoint target and delete linked Empty object"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        idx = props.prompt_schedule_index
+        if 0 <= idx < len(props.prompt_schedule):
+            item = props.prompt_schedule[idx]
+            remove_waypoint_empty(item)
+            item.has_waypoint = False
+            tag_redraw_view3d(context)
+            send_waypoints_to_bridge(context)
+            self.report({'INFO'}, "Waypoint removed.")
+        return {'FINISHED'}
+
+class CEB_OT_SelectPromptItem(bpy.types.Operator):
+    bl_idname = "ceb.select_prompt_item"
+    bl_label = "Select Prompt Item"
+    bl_description = "Select this prompt schedule item, jump to its start frame, and select its waypoint object"
+
+    index: bpy.props.IntProperty(default=0)
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        if 0 <= self.index < len(props.prompt_schedule):
+            props.prompt_schedule_index = self.index
+            item = props.prompt_schedule[self.index]
+            
+            # Jump timeline cursor to start frame
+            context.scene.frame_set(item.start_frame)
+            
+            # Select linked Empty object in 3D View if present
+            if getattr(item, "has_waypoint", False) and getattr(item, "waypoint_object_name", ""):
+                obj = bpy.data.objects.get(item.waypoint_object_name)
+                if obj:
+                    bpy.ops.object.select_all(action='DESELECT')
+                    obj.select_set(True)
+                    context.view_layer.objects.active = obj
+                    
+            tag_redraw_view3d(context)
+        return {'FINISHED'}
+
+def get_or_create_waypoint_empty(context, item):
+    obj_name = item.waypoint_object_name
+    obj = bpy.data.objects.get(obj_name) if obj_name else None
+    
+    if not obj:
+        base_name = f"ARDY_Waypoint_F{item.start_frame}"
+        obj_name = base_name
+        idx = 1
+        while bpy.data.objects.get(obj_name):
+            obj_name = f"{base_name}_{idx}"
+            idx += 1
+            
+        empty_data = None
+        obj = bpy.data.objects.new(obj_name, empty_data)
+        obj.empty_display_type = 'SINGLE_ARROW'
+        obj.empty_display_size = 0.5
+        obj.show_name = True
+        
+        col_name = "ARDY_Waypoints"
+        collection = bpy.data.collections.get(col_name)
+        if not collection:
+            collection = bpy.data.collections.new(col_name)
+            context.scene.collection.children.link(collection)
+        collection.objects.link(obj)
+        
+        item.waypoint_object_name = obj.name
+
+    obj.location = item.waypoint_co
+    return obj
+
+@persistent
+def ardy_depsgraph_sync_waypoints(scene, depsgraph=None):
+    if not hasattr(scene, "ceb_ardy"):
+        return
+    props = scene.ceb_ardy
+    for item in props.prompt_schedule:
+        if item.has_waypoint and item.waypoint_object_name:
+            obj = bpy.data.objects.get(item.waypoint_object_name)
+            if obj:
+                loc_vec = mathutils.Vector(item.waypoint_co)
+                if (obj.location - loc_vec).length > 1e-4:
+                    item.waypoint_co = obj.location
+
+class CEB_OT_AddWaypoint(bpy.types.Operator):
+    bl_idname = "ceb.add_waypoint"
+    bl_label = "Add Waypoint in 3D View"
+    bl_description = "Click in the 3D Viewport to place a new Waypoint at the target location"
+
+    def modal(self, context, event):
+        context.area.tag_redraw()
+
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            region = context.region
+            rv3d = context.region_data
+            coord = (event.mouse_region_x, event.mouse_region_y)
+
+            from bpy_extras.view3d_utils import region_2d_to_location_3d, region_2d_to_vector_3d, region_2d_to_origin_3d
+            
+            origin = region_2d_to_origin_3d(region, rv3d, coord)
+            direction = region_2d_to_vector_3d(region, rv3d, coord)
+
+            # Raycast onto ground plane Z=0
+            if abs(direction.z) > 1e-6:
+                t = -origin.z / direction.z
+                target_co = origin + t * direction
+            else:
+                target_co = region_2d_to_location_3d(region, rv3d, coord, (0, 0, 0))
+
+            props = context.scene.ceb_ardy
+            item = props.prompt_schedule.add()
+            item.start_frame = 0 if len(props.prompt_schedule) == 1 else context.scene.frame_current
+            item.prompt = ""
+            item.has_waypoint = True
+            item.waypoint_co = target_co
+
+            # Spawn Blender Empty object for native control
+            get_or_create_waypoint_empty(context, item)
+
+            props.prompt_schedule_index = len(props.prompt_schedule) - 1
+            tag_redraw_view3d(context)
+            send_waypoints_to_bridge(context)
+            self.report({'INFO'}, f"Placed Waypoint at ({target_co.x:.2f}, {target_co.y:.2f}, {target_co.z:.2f})")
+            return {'FINISHED'}
+
+        elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            self.report({'INFO'}, "Waypoint placement cancelled.")
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
+    def invoke(self, context, event):
+        if context.space_data and context.space_data.type == 'VIEW_3D':
+            context.window_manager.modal_handler_add(self)
+            self.report({'INFO'}, "Click in 3D Viewport to place Waypoint (Esc to cancel)")
+            return {'RUNNING_MODAL'}
+        else:
+            self.report({'WARNING'}, "Active space must be a 3D Viewport")
+            return {'CANCELLED'}
+
 def draw_round_rect_2d(x, y, width, height, color):
     try:
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -223,6 +490,60 @@ def draw_round_rect_2d(x, y, width, height, color):
     indices = [(0, 1, 2), (0, 2, 3)]
     batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
     batch.draw(shader)
+
+def draw_waypoints_3d_view(self, context):
+    if context is None:
+        context = bpy.context
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return
+    props = context.scene.ceb_ardy
+    if not props.show_prompt_overlay:
+        return
+
+    try:
+        shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+    except Exception:
+        try:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        except Exception:
+            return
+
+    shader.bind()
+    font_id = 0
+
+    try:
+        gpu.state.blend_set('ALPHA')
+    except Exception:
+        pass
+
+    for item in props.prompt_schedule:
+        if not item.enabled or not getattr(item, "has_waypoint", False):
+            continue
+
+        co = mathutils.Vector(item.waypoint_co)
+        ground_co = mathutils.Vector((co.x, co.y, 0.0))
+        top_co = mathutils.Vector((co.x, co.y, co.z + 0.6))
+
+        vertices = [(ground_co.x, ground_co.y, ground_co.z), (top_co.x, top_co.y, top_co.z)]
+        
+        shader.uniform_float("color", (0.0, 0.85, 1.0, 0.9))
+        batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
+        batch.draw(shader)
+
+        region = context.region
+        rv3d = context.region_data
+        if region and rv3d:
+            from bpy_extras.view3d_utils import location_3d_to_region_2d
+            screen_pos = location_3d_to_region_2d(region, rv3d, top_co)
+            if screen_pos:
+                lbl_text = f"📍 F{item.start_frame}: Waypoint ({co.x:.1f}, {co.y:.1f}, {co.z:.1f})"
+                try:
+                    blf.size(font_id, 11)
+                    blf.color(font_id, 0.0, 0.95, 1.0, 1.0)
+                    blf.position(font_id, int(screen_pos.x) + 8, int(screen_pos.y) + 4, 0)
+                    blf.draw(font_id, lbl_text)
+                except Exception:
+                    pass
 
 def draw_prompt_overlay_px(self, context):
     if context is None:
@@ -329,7 +650,15 @@ def draw_prompt_overlay_px(self, context):
             draw_round_rect_2d(int(x1), track_y + 2, int(seg_w), track_h - 4, col)
             draw_round_rect_2d(int(x1), track_y - 2, 2, track_h + 4, (1.0, 1.0, 1.0, 0.8 if item.enabled else 0.3))
 
-            lbl_str = f"F{f_start}: {item.prompt}"
+            if getattr(item, "has_waypoint", False):
+                # Draw glowing diamond pin indicator on timeline track
+                px_center = int(x1)
+                py_center = track_y + track_h // 2
+                draw_round_rect_2d(px_center - 3, py_center - 4, 6, 8, (0.0, 0.95, 1.0, 1.0))
+                lbl_str = f"📍 F{f_start}: {item.prompt}"
+            else:
+                lbl_str = f"F{f_start}: {item.prompt}"
+
             try:
                 blf.size(font_id, 10)
                 if is_active:
@@ -1158,6 +1487,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             # Send initial model, prompt, and current frame in Blender
             initial_cmd = f"MODEL:{props.model}\nPROMPT:{active_prompt}\nFRAME:{current_frame}\n"
             _realtime_client.sendall(initial_cmd.encode("utf-8"))
+            send_waypoints_to_bridge(context)
         except Exception as e:
             self.report({'ERROR'}, f"Connection failed: {e}. Is the Bridge Process running?")
             _realtime_client = None
@@ -1269,9 +1599,13 @@ classes = (
     CEB_Ardy_PromptItem,
     CEB_Ardy_SceneProperties,
     CEB_OT_AddPromptItem,
+    CEB_OT_AddWaypoint,
+    CEB_OT_RemoveWaypoint,
+    CEB_OT_SelectPromptItem,
     CEB_OT_RemovePromptItem,
     CEB_OT_ClearPromptItems,
     CEB_OT_MovePromptItem,
+    CEB_OT_SortPromptItems,
     CEB_OT_ArdyRunServer,
     CEB_OT_ArdyRunDemo,
     CEB_OT_ArdyImportNPZ,
@@ -1281,7 +1615,7 @@ classes = (
 )
 
 def register():
-    global _overlay_draw_handler
+    global _overlay_draw_handler, _3d_draw_handler
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ceb_ardy = bpy.props.PointerProperty(type=CEB_Ardy_SceneProperties)
@@ -1290,18 +1624,25 @@ def register():
         _overlay_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_prompt_overlay_px, (None, None), 'WINDOW', 'POST_PIXEL'
         )
+    if _3d_draw_handler is None:
+        _3d_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_waypoints_3d_view, (None, None), 'WINDOW', 'POST_VIEW'
+        )
         
-    if ardy_frame_change_handler not in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.append(ardy_frame_change_handler)
+    if ardy_depsgraph_sync_waypoints not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(ardy_depsgraph_sync_waypoints)
 
 def unregister():
-    global _overlay_draw_handler
+    global _overlay_draw_handler, _3d_draw_handler
     if _overlay_draw_handler is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_overlay_draw_handler, 'WINDOW')
         _overlay_draw_handler = None
+    if _3d_draw_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_3d_draw_handler, 'WINDOW')
+        _3d_draw_handler = None
         
-    if ardy_frame_change_handler in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.remove(ardy_frame_change_handler)
+    if ardy_depsgraph_sync_waypoints in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(ardy_depsgraph_sync_waypoints)
 
     del bpy.types.Scene.ceb_ardy
     for cls in reversed(classes):

@@ -10,9 +10,9 @@ bl_info = {
 
 ### OK - 4 bit quantization
 ### OK - List of prompts
-###         - Esta demorando muito para poder agir, tentar ajustar para ser mais rapido
+###        OK - Esta demorando muito para poder agir, tentar ajustar para ser mais rapido
 ### OK - clear animation (blender e blender bridge)
-### - add waypoints
+### OK - add waypoints
 ### - add constraints
 
 import bpy

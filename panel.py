@@ -7,7 +7,14 @@ class CEB_UL_PromptList(bpy.types.UIList):
             row = layout.row(align=True)
             row.prop(item, "enabled", text="", icon='CHECKBOX_HLT' if item.enabled else 'CHECKBOX_DEHLT', emboss=False)
             row.prop(item, "start_frame", text="Frame", emboss=True)
-            row.prop(item, "prompt", text="", emboss=True)
+            if getattr(item, "has_waypoint", False):
+                row.label(text="Waypoint", icon='ORIENTATION_LOCAL')
+                op = row.operator("ceb.select_prompt_item", text="", icon='RESTRICT_SELECT_OFF', emboss=False)
+                op.index = index
+            else:
+                row.prop(item, "prompt", text="", emboss=True)
+                op = row.operator("ceb.select_prompt_item", text="", icon='RESTRICT_SELECT_OFF', emboss=False)
+                op.index = index
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text=str(item.start_frame))
@@ -103,11 +110,27 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         
         col = row.column(align=True)
         col.operator("ceb.add_prompt_item", text="", icon='ADD')
+        col.operator("ceb.add_waypoint", text="", icon='ORIENTATION_LOCAL')
         col.operator("ceb.remove_prompt_item", text="", icon='REMOVE')
         col.operator("ceb.clear_prompt_items", text="", icon='TRASH')
         col.separator()
+        col.operator("ceb.sort_prompt_items", text="", icon='SORTTIME')
+        col.separator()
         col.operator("ceb.move_prompt_item", text="", icon='TRIA_UP').direction = 'UP'
         col.operator("ceb.move_prompt_item", text="", icon='TRIA_DOWN').direction = 'DOWN'
+
+        # Selected Prompt / Waypoint Details Box
+        if 0 <= props.prompt_schedule_index < len(props.prompt_schedule):
+            selected_item = props.prompt_schedule[props.prompt_schedule_index]
+            wp_box = box.box()
+            wp_row = wp_box.row(align=True)
+            wp_row.prop(selected_item, "has_waypoint", text="3D Waypoint Target")
+            if selected_item.has_waypoint:
+                wp_row.operator("ceb.remove_waypoint", text="", icon='X')
+                loc_row = wp_box.row(align=True)
+                loc_row.prop(selected_item, "waypoint_co", text="Location")
+                if selected_item.waypoint_object_name:
+                    wp_box.label(text=f"Linked Empty: {selected_item.waypoint_object_name}", icon='EMPTY_DATA')
 
 classes = (
     CEB_UL_PromptList,
