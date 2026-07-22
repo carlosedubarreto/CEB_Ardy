@@ -21,30 +21,50 @@ _active_stream_operator = None
 _overlay_draw_handler = None
 _3d_draw_handler = None
 
-def tag_redraw_view3d(context=None):
+def tag_redraw_view3d(self=None, context=None):
     if context is None:
-        context = bpy.context
+        if isinstance(self, bpy.types.Context):
+            context = self
+        else:
+            context = bpy.context
     if hasattr(context, "window_manager") and context.window_manager:
         for window in context.window_manager.windows:
             for area in window.screen.areas:
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
 
-def send_waypoints_to_bridge(context=None):
-    global _realtime_client, _realtime_running
+def send_waypoints_to_bridge(context=None, start_frame=None):
+    global _realtime_client, _realtime_running, _active_stream_operator
     if not _realtime_client or not _realtime_running:
         return
     if context is None:
         context = bpy.context
-    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+    char = get_active_character(context)
+    if not char:
         return
-    props = context.scene.ceb_ardy
+    
+    if start_frame is None:
+        if _active_stream_operator is not None and hasattr(_active_stream_operator, "_start_frame"):
+            start_frame = _active_stream_operator._start_frame
+        else:
+            start_frame = context.scene.frame_current
+
     try:
         _realtime_client.sendall(b"CLEAR_WAYPOINTS\n")
-        for item in props.prompt_schedule:
+        for item in char.prompt_schedule:
             if item.enabled and getattr(item, "has_waypoint", False):
-                co = item.waypoint_co
-                cmd = f"WAYPOINT:{item.start_frame}:{co[0]:.4f}:{co[1]:.4f}:{co[2]:.4f}\n"
+                if item.start_frame < start_frame:
+                    continue
+                if item.waypoint_object_name:
+                    wp_obj = bpy.data.objects.get(item.waypoint_object_name)
+                    if wp_obj:
+                        global_co = wp_obj.matrix_world.to_translation()
+                    else:
+                        global_co = mathutils.Vector(item.waypoint_co)
+                else:
+                    global_co = mathutils.Vector(item.waypoint_co)
+
+                cmd = f"WAYPOINT:{item.start_frame}:{global_co[0]:.4f}:{global_co[1]:.4f}:{global_co[2]:.4f}\n"
                 _realtime_client.sendall(cmd.encode("utf-8"))
     except Exception as e:
         print(f"[CEB Ardy] Error sending waypoints over socket: {e}")
@@ -73,6 +93,29 @@ _smpl24_names = [
 ]
 _smpl22_names = _smpl24_names[:22]
 
+def get_char_prefix(char):
+    if not char:
+        return "C1"
+    name = char.name.strip()
+    import re
+    match = re.match(r'^(?:Character|Char)[_\s-]?(\d+)$', name, re.IGNORECASE)
+    if match:
+        return f"C{match.group(1)}"
+    
+    words = name.replace("_", " ").replace("-", " ").split()
+    if len(words) > 1:
+        prefix = "".join(w[0].upper() for w in words if w)
+        if words[-1].isdigit():
+            prefix = prefix[:-1] + words[-1]
+        return prefix
+    else:
+        match = re.search(r'(\d+)$', name)
+        if match:
+            num = match.group(1)
+            non_num = name[:-len(num)]
+            return (non_num[0].upper() if non_num else "") + num
+        return name[:3].upper()
+
 def remove_pose_constraint_armature(item):
     obj_name = getattr(item, "pose_armature_name", "")
     if obj_name:
@@ -83,25 +126,42 @@ def remove_pose_constraint_armature(item):
             except Exception as e:
                 print(f"[CEB Ardy] Error removing pose constraint armature: {e}")
 
-    base_name = f"ARDY_Pose_F{item.start_frame}"
+    # Fallback search matching ARDY_Pose_F<frame> or <prefix>_Ardy_Pose_F<frame>
     for obj in list(bpy.data.objects):
-        if obj.type == 'ARMATURE' and (obj.name == base_name or obj.name.startswith(f"{base_name}_")):
-            try:
-                bpy.data.objects.remove(obj, do_unlink=True)
-            except Exception:
-                pass
+        if obj.type == 'ARMATURE':
+            is_match = False
+            if obj.name.startswith(f"ARDY_Pose_F{item.start_frame}"):
+                is_match = True
+            elif "Ardy_Pose_F" in obj.name:
+                parts = obj.name.split("Ardy_Pose_F")
+                if len(parts) > 1:
+                    frame_part = parts[1].split("_")[0]
+                    if frame_part.isdigit() and int(frame_part) == item.start_frame:
+                        is_match = True
+            if is_match:
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                except Exception:
+                    pass
 
     item.pose_armature_name = ""
 
-def get_or_create_pose_constraint_armature(context, item):
+def get_or_create_pose_constraint_armature(context, item, copy_current_pose=True):
     obj_name = getattr(item, "pose_armature_name", "")
     obj = bpy.data.objects.get(obj_name) if obj_name else None
 
     if not obj:
         char_arm = None
-        if context.active_object and context.active_object.type == 'ARMATURE' and not context.active_object.name.startswith("ARDY_Pose_"):
+        char = get_active_character(context)
+        if char and char.arm_obj_name:
+            candidate_obj = bpy.data.objects.get(char.arm_obj_name)
+            if candidate_obj:
+                char_arm = candidate_obj
+
+        if not char_arm and context.active_object and context.active_object.type == 'ARMATURE' and not context.active_object.name.startswith("ARDY_Pose_") and not "_Ardy_Pose_F" in context.active_object.name:
             char_arm = context.active_object
-        else:
+        
+        if not char_arm:
             for candidate in ["Core_Armature", "SOMA_Armature"]:
                 candidate_obj = bpy.data.objects.get(candidate)
                 if candidate_obj:
@@ -109,7 +169,7 @@ def get_or_create_pose_constraint_armature(context, item):
                     break
         if not char_arm:
             for o in context.scene.objects:
-                if o.type == 'ARMATURE' and not o.name.startswith("ARDY_Pose_"):
+                if o.type == 'ARMATURE' and not o.name.startswith("ARDY_Pose_") and not "_Ardy_Pose_F" in o.name:
                     char_arm = o
                     break
 
@@ -117,7 +177,8 @@ def get_or_create_pose_constraint_armature(context, item):
             print("[CEB Ardy] No character armature found to duplicate for pose constraint.")
             return None
 
-        base_name = f"ARDY_Pose_F{item.start_frame}"
+        prefix = get_char_prefix(char)
+        base_name = f"{prefix}_Ardy_Pose_F{item.start_frame}"
         obj_name = base_name
         idx = 1
         while bpy.data.objects.get(obj_name):
@@ -138,13 +199,26 @@ def get_or_create_pose_constraint_armature(context, item):
             collection = bpy.data.collections.new(col_name)
             context.scene.collection.children.link(collection)
         collection.objects.link(obj)
+        if hasattr(context, "view_layer") and context.view_layer:
+            context.view_layer.update()
+
+        if copy_current_pose and char_arm.pose and obj.pose:
+            for src_bone in char_arm.pose.bones:
+                tgt_bone = obj.pose.bones.get(src_bone.name)
+                if tgt_bone:
+                    tgt_bone.rotation_mode = src_bone.rotation_mode
+                    tgt_bone.location = src_bone.location.copy()
+                    tgt_bone.rotation_quaternion = src_bone.rotation_quaternion.copy()
+                    tgt_bone.rotation_euler = src_bone.rotation_euler.copy()
+                    tgt_bone.rotation_axis_angle = list(src_bone.rotation_axis_angle)
+                    tgt_bone.scale = src_bone.scale.copy()
 
         item.pose_armature_name = obj.name
 
     return obj
 
-def send_pose_constraints_to_bridge(context=None):
-    global _realtime_client, _realtime_running
+def send_pose_constraints_to_bridge(context=None, start_frame=None):
+    global _realtime_client, _realtime_running, _active_stream_operator
     if not _realtime_client or not _realtime_running:
         return
     if context is None:
@@ -152,20 +226,38 @@ def send_pose_constraints_to_bridge(context=None):
     if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
         return
     props = context.scene.ceb_ardy
+    char = get_active_character(context)
+    if not char:
+        return
+    
+    if start_frame is None:
+        if _active_stream_operator is not None and hasattr(_active_stream_operator, "_start_frame"):
+            start_frame = _active_stream_operator._start_frame
+        else:
+            start_frame = context.scene.frame_current
+
     scale = props.import_scale
     try:
         _realtime_client.sendall(b"CLEAR_POSE_CONSTRAINTS\n")
         import json
-        for item in props.prompt_schedule:
-            if item.enabled and getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
-                arm_obj = bpy.data.objects.get(item.pose_armature_name)
-                if not arm_obj:
-                    continue
 
+        # 1. Send current viewport pose as starting constraint at start_frame
+        has_existing_start_constraint = any(
+            item.enabled and getattr(item, "has_pose_constraint", False) and item.start_frame == start_frame
+            for item in char.prompt_schedule
+        )
+
+        if not has_existing_start_constraint:
+            arm_obj = None
+            if char.arm_obj_name:
+                arm_obj = bpy.data.objects.get(char.arm_obj_name)
+            if not arm_obj:
+                clean_name = char.name.replace(" ", "_")
+                arm_obj = bpy.data.objects.get(f"{clean_name}_Armature")
+
+            if arm_obj and arm_obj.pose:
                 bone_names = [b.name for b in arm_obj.pose.bones]
                 num_bones = len(bone_names)
-
-                # Determine ARDY joint name order for this skeleton
                 if num_bones == 30:
                     joint_order = _soma30_names
                 elif num_bones == 24:
@@ -173,7 +265,6 @@ def send_pose_constraints_to_bridge(context=None):
                 elif num_bones == 22:
                     joint_order = _smpl22_names
                 else:
-                    # Fallback: use Blender's own bone order
                     joint_order = bone_names
 
                 joints_pos = []
@@ -181,11 +272,58 @@ def send_pose_constraints_to_bridge(context=None):
                 for jname in joint_order:
                     bone = arm_obj.pose.bones.get(jname)
                     if bone is None:
-                        # Bone not found: output identity/zero
                         joints_pos.append([0.0, 0.0, 0.0])
                         joints_rot.append([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
                         continue
 
+                    # Capture absolute world space transform for ARDY constraints
+                    mat_world = arm_obj.matrix_world @ bone.matrix
+                    head_loc = mat_world.to_translation()
+                    rot_mat = mat_world.to_3x3()
+
+                    pos_a = blender_pos_to_ardy(head_loc, scale=scale)
+                    rot_a = blender_rot_to_ardy(rot_mat)
+
+                    joints_pos.append(pos_a)
+                    joints_rot.append(rot_a)
+
+                pos_json = json.dumps(joints_pos)
+                rot_json = json.dumps(joints_rot)
+                cmd = f"POSE_CONSTRAINT:{start_frame}:{pos_json}:{rot_json}\n"
+                _realtime_client.sendall(cmd.encode("utf-8"))
+                print(f"[CEB Ardy] Sent initial/current viewport pose constraint for frame {start_frame}")
+
+        # 2. Send prompt_schedule pose constraints
+        for item in char.prompt_schedule:
+            if item.enabled and getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
+                if item.start_frame < start_frame:
+                    continue
+                arm_obj = bpy.data.objects.get(item.pose_armature_name)
+                if not arm_obj:
+                    continue
+
+                bone_names = [b.name for b in arm_obj.pose.bones]
+                num_bones = len(bone_names)
+
+                if num_bones == 30:
+                    joint_order = _soma30_names
+                elif num_bones == 24:
+                    joint_order = _smpl24_names
+                elif num_bones == 22:
+                    joint_order = _smpl22_names
+                else:
+                    joint_order = bone_names
+
+                joints_pos = []
+                joints_rot = []
+                for jname in joint_order:
+                    bone = arm_obj.pose.bones.get(jname)
+                    if bone is None:
+                        joints_pos.append([0.0, 0.0, 0.0])
+                        joints_rot.append([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+                        continue
+
+                    # Capture absolute world space transform for ARDY constraints
                     mat_world = arm_obj.matrix_world @ bone.matrix
                     head_loc = mat_world.to_translation()
                     rot_mat = mat_world.to_3x3()
@@ -200,6 +338,7 @@ def send_pose_constraints_to_bridge(context=None):
                 rot_json = json.dumps(joints_rot)
                 cmd = f"POSE_CONSTRAINT:{item.start_frame}:{pos_json}:{rot_json}\n"
                 _realtime_client.sendall(cmd.encode("utf-8"))
+                print(f"[CEB Ardy] Sent scheduled pose constraint for frame {item.start_frame} ({num_bones} joints)")
     except Exception as e:
         print(f"[CEB Ardy] Error sending pose constraints over socket: {e}")
 
@@ -221,14 +360,23 @@ def remove_waypoint_empty(item):
             except Exception as e:
                 print(f"[CEB Ardy] Error removing waypoint empty: {e}")
 
-    # Fallback search for any Empty object matching ARDY_Waypoint_F<start_frame>
-    base_name = f"ARDY_Waypoint_F{item.start_frame}"
+    # Fallback search matching ARDY_Waypoint_F<frame> or <prefix>_Ardy_waypoint_F<frame>
     for obj in list(bpy.data.objects):
-        if obj.type == 'EMPTY' and (obj.name == base_name or obj.name.startswith(f"{base_name}_")):
-            try:
-                bpy.data.objects.remove(obj, do_unlink=True)
-            except Exception:
-                pass
+        if obj.type == 'EMPTY':
+            is_match = False
+            if obj.name.startswith(f"ARDY_Waypoint_F{item.start_frame}"):
+                is_match = True
+            elif "Ardy_waypoint_F" in obj.name:
+                parts = obj.name.split("Ardy_waypoint_F")
+                if len(parts) > 1:
+                    frame_part = parts[1].split("_")[0]
+                    if frame_part.isdigit() and int(frame_part) == item.start_frame:
+                        is_match = True
+            if is_match:
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                except Exception:
+                    pass
 
     item.waypoint_object_name = ""
 
@@ -241,9 +389,39 @@ def update_has_waypoint(self, context):
     send_waypoints_to_bridge(context)
 
 def update_prompt_item(self, context):
+    global _realtime_client, _active_stream_operator
     tag_redraw_view3d(context)
     send_waypoints_to_bridge(context)
     send_pose_constraints_to_bridge(context)
+    if _realtime_client and context and hasattr(context, "scene") and hasattr(context.scene, "ceb_ardy"):
+        char = get_active_character(context)
+        if char:
+            current_frame = context.scene.frame_current
+            active_prompt = get_active_prompt_for_frame(context.scene.ceb_ardy, current_frame)
+            try:
+                prompt_cmd = f"PROMPT:{active_prompt}\n"
+                _realtime_client.sendall(prompt_cmd.encode("utf-8"))
+                if _active_stream_operator is not None and hasattr(_active_stream_operator, "_frame_queue"):
+                    if len(_active_stream_operator._frame_queue) > 3:
+                        _active_stream_operator._frame_queue = _active_stream_operator._frame_queue[:3]
+                    _active_stream_operator._last_sent_prompt = active_prompt
+                print(f"[CEB Ardy] Prompt item updated & sent → '{active_prompt}'")
+            except Exception as e:
+                print(f"[CEB Ardy] Failed to send updated prompt: {e}")
+
+def update_realtime_prompt(self, context):
+    global _realtime_client, _active_stream_operator
+    if _realtime_client:
+        try:
+            prompt_cmd = f"PROMPT:{self.realtime_prompt}\n"
+            _realtime_client.sendall(prompt_cmd.encode("utf-8"))
+            if _active_stream_operator is not None and hasattr(_active_stream_operator, "_frame_queue"):
+                if len(_active_stream_operator._frame_queue) > 3:
+                    _active_stream_operator._frame_queue = _active_stream_operator._frame_queue[:3]
+                _active_stream_operator._last_sent_prompt = self.realtime_prompt
+            print(f"[CEB Ardy] Prompt update sent → '{self.realtime_prompt}'")
+        except Exception as e:
+            print(f"[CEB Ardy] Failed to send prompt over socket: {e}")
 
 def update_overlay_visibility(self, context):
     tag_redraw_view3d(context)
@@ -307,36 +485,153 @@ class CEB_Ardy_PromptItem(bpy.types.PropertyGroup):
         default=""
     )
 
-def update_realtime_prompt(self, context):
-    global _realtime_client
-    if _realtime_client:
-        try:
-            prompt_cmd = f"PROMPT:{self.realtime_prompt}\n"
-            _realtime_client.sendall(prompt_cmd.encode("utf-8"))
-        except Exception as e:
-            print(f"[CEB Ardy] Failed to send prompt over socket: {e}")
-
-def get_active_prompt_for_frame(props, frame):
-    if hasattr(props, "prompt_schedule") and len(props.prompt_schedule) > 0:
-        sorted_schedule = sorted(props.prompt_schedule, key=lambda x: x.start_frame)
-        active_prompt = None
-        for item in sorted_schedule:
-            if item.enabled and frame >= item.start_frame:
-                if item.prompt and item.prompt.strip() and not getattr(item, "has_waypoint", False):
-                    active_prompt = item.prompt
-        if active_prompt:
-            return active_prompt
-    return props.realtime_prompt if props.realtime_prompt else "walk"
-
-class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
+class CEB_Ardy_Character(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(
+        name="Name",
+        description="Character name",
+        default="Character_1",
+        update=tag_redraw_view3d
+    )
     model: bpy.props.EnumProperty(
         name="Model",
         description="Model to use for motion",
         items=[
-            ('core', "CORE", "CORE 27-joint skeleton"),
-            ('soma', "SOMA", "SOMA 77-joint skeleton")
+            ('core', "CORE", "CORE 27-joint skeleton")
         ],
         default='core'
+    )
+    realtime_prompt: bpy.props.StringProperty(
+        name="Live Prompt",
+        description="Text prompt sent to ARDY in real-time",
+        default="walk",
+        update=update_realtime_prompt
+    )
+    prompt_schedule: bpy.props.CollectionProperty(
+        type=CEB_Ardy_PromptItem
+    )
+    prompt_schedule_index: bpy.props.IntProperty(
+        name="Active Prompt Index",
+        default=0
+    )
+    arm_obj_name: bpy.props.StringProperty(default="")
+    mesh_obj_name: bpy.props.StringProperty(default="")
+    parent_obj_name: bpy.props.StringProperty(default="")
+
+def get_active_character(context=None):
+    if context is None:
+        context = bpy.context
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return None
+    props = context.scene.ceb_ardy
+    if 0 <= props.active_character_index < len(props.characters):
+        return props.characters[props.active_character_index]
+    elif len(props.characters) > 0:
+        return props.characters[0]
+    return None
+
+def get_active_prompt_for_frame(props=None, frame=0, context=None):
+    char = get_active_character(context)
+    if char and len(char.prompt_schedule) > 0:
+        text_items = [item for item in char.prompt_schedule if item.enabled and item.prompt and item.prompt.strip() and not getattr(item, "has_waypoint", False)]
+        if text_items:
+            sorted_schedule = sorted(text_items, key=lambda x: x.start_frame)
+            active_prompt = None
+            for item in sorted_schedule:
+                if frame >= item.start_frame:
+                    active_prompt = item.prompt
+            if active_prompt:
+                return active_prompt
+    if char and char.realtime_prompt:
+        return char.realtime_prompt
+    return "walk"
+
+def get_character_world_transform(char):
+    char_x, char_y, char_z = 0.0, 0.0, 0.0
+    char_heading = 0.0
+    
+    if not char:
+        return char_x, char_y, char_z, char_heading
+
+    clean_name = char.name.replace(" ", "_")
+    arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
+    arm_obj = bpy.data.objects.get(arm_name)
+    
+    if arm_obj:
+        root_bone = arm_obj.pose.bones[0] if arm_obj.pose.bones else None
+        if root_bone:
+            world_matrix = arm_obj.matrix_world @ root_bone.matrix
+        else:
+            world_matrix = arm_obj.matrix_world
+        
+        world_loc = world_matrix.to_translation()
+        char_x = world_loc.x
+        char_y = world_loc.y
+        char_z = world_loc.z
+        char_heading = world_matrix.to_euler().z
+    else:
+        parent_name = char.parent_obj_name if char.parent_obj_name else f"ARDY_Character_{clean_name}"
+        parent_obj = bpy.data.objects.get(parent_name)
+        if parent_obj:
+            world_loc = parent_obj.matrix_world.to_translation()
+            char_x = world_loc.x
+            char_y = world_loc.y
+            char_z = world_loc.z
+            char_heading = parent_obj.matrix_world.to_euler().z
+            
+    return char_x, char_y, char_z, char_heading
+
+def update_active_character(self, context):
+    tag_redraw_view3d(context)
+    
+    char = get_active_character(context)
+    if char:
+        clean_name = char.name.replace(" ", "_")
+        arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
+        arm_obj = bpy.data.objects.get(arm_name)
+        if arm_obj:
+            try:
+                # Switch to object mode first if we are in another mode
+                if context.active_object and context.active_object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                
+                # Deselect all objects
+                for o in context.view_layer.objects:
+                    o.select_set(False)
+                    
+                # Select the armature and make it active
+                arm_obj.select_set(True)
+                context.view_layer.objects.active = arm_obj
+            except Exception as select_err:
+                print(f"[CEB Ardy] Failed to select armature '{arm_name}' in viewport: {select_err}")
+
+    global _realtime_client, _active_stream_operator
+    if _realtime_client:
+        if char:
+            current_frame = context.scene.frame_current if hasattr(context, "scene") else 0
+            active_prompt = get_active_prompt_for_frame(context.scene.ceb_ardy, current_frame, context=context)
+            try:
+                char_x, char_y, char_z, char_heading = get_character_world_transform(char)
+                switch_cmd = f"SWITCH_CHAR:{char.name}:{char.model}:{active_prompt}:{current_frame}:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}\n"
+                _realtime_client.sendall(switch_cmd.encode("utf-8"))
+                if _active_stream_operator is not None:
+                    _active_stream_operator._start_frame = current_frame
+                send_waypoints_to_bridge(context, start_frame=current_frame)
+                send_pose_constraints_to_bridge(context, start_frame=current_frame)
+                if _active_stream_operator is not None and hasattr(_active_stream_operator, "_frame_queue"):
+                    _active_stream_operator._frame_queue = []
+                    _active_stream_operator._last_sent_prompt = active_prompt
+                print(f"[CEB Ardy] Switched active character to '{char.name}' (pos={char_x:.2f},{char_y:.2f},{char_z:.2f}) → Synced bridge.")
+            except Exception as e:
+                print(f"[CEB Ardy] Error syncing active character to bridge: {e}")
+
+class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
+    characters: bpy.props.CollectionProperty(
+        type=CEB_Ardy_Character
+    )
+    active_character_index: bpy.props.IntProperty(
+        name="Active Character",
+        default=0,
+        update=update_active_character
     )
     quantize_4bit: bpy.props.BoolProperty(
         name="4-bit Quantization (bitsandbytes)",
@@ -348,12 +643,6 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         description="Scale factor applied to joint coordinates",
         default=1.0,
         min=0.001
-    )
-    realtime_prompt: bpy.props.StringProperty(
-        name="Live Prompt",
-        description="Text prompt sent to ARDY in real-time",
-        default="walk",
-        update=update_realtime_prompt
     )
     realtime_recording: bpy.props.BoolProperty(
         name="Live Record",
@@ -372,12 +661,15 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         min=1024,
         max=65535
     )
-    prompt_schedule: bpy.props.CollectionProperty(
-        type=CEB_Ardy_PromptItem
-    )
-    prompt_schedule_index: bpy.props.IntProperty(
-        name="Active Prompt Index",
-        default=0
+    overlay_view_mode: bpy.props.EnumProperty(
+        name="Overlay View Mode",
+        description="Display overlay for active character only or all characters",
+        items=[
+            ('SELECTED', "Selected Only", "Show overlay for the currently selected character"),
+            ('ALL', "All Characters", "Show overlay for all loaded characters in scene")
+        ],
+        default='SELECTED',
+        update=update_overlay_visibility
     )
     show_prompt_overlay: bpy.props.BoolProperty(
         name="Show Overlay in 3D View",
@@ -386,20 +678,68 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         update=update_overlay_visibility
     )
 
-class CEB_OT_AddPromptItem(bpy.types.Operator):
-    bl_idname = "ceb.add_prompt_item"
-    bl_label = "Add Prompt"
-    bl_description = "Add a new prompt schedule item"
+class CEB_OT_AddCharacterEntry(bpy.types.Operator):
+    bl_idname = "ceb.add_character_entry"
+    bl_label = "Add Character"
+    bl_description = "Add a new character configuration"
 
     def execute(self, context):
         props = context.scene.ceb_ardy
-        item = props.prompt_schedule.add()
-        if len(props.prompt_schedule) == 1:
+        idx = len(props.characters) + 1
+        name = f"Character_{idx}"
+        while any(c.name == name for c in props.characters):
+            idx += 1
+            name = f"Character_{idx}"
+        char = props.characters.add()
+        char.name = name
+        char.model = 'core'
+        props.active_character_index = len(props.characters) - 1
+        
+        # Automatically load the character mesh & armature into the scene
+        bpy.ops.ceb.load_character()
+        
+        tag_redraw_view3d(context)
+        return {'FINISHED'}
+
+class CEB_OT_RemoveCharacterEntry(bpy.types.Operator):
+    bl_idname = "ceb.remove_character_entry"
+    bl_label = "Remove Character"
+    bl_description = "Remove the selected character configuration and its Blender objects"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        idx = props.active_character_index
+        if 0 <= idx < len(props.characters):
+            char = props.characters[idx]
+            for obj_name in [char.arm_obj_name, char.mesh_obj_name, char.parent_obj_name]:
+                if obj_name:
+                    obj = bpy.data.objects.get(obj_name)
+                    if obj:
+                        bpy.data.objects.remove(obj, do_unlink=True)
+            for item in char.prompt_schedule:
+                remove_waypoint_empty(item)
+                remove_pose_constraint_armature(item)
+            props.characters.remove(idx)
+            props.active_character_index = max(0, idx - 1)
+            tag_redraw_view3d(context)
+        return {'FINISHED'}
+
+class CEB_OT_AddPromptItem(bpy.types.Operator):
+    bl_idname = "ceb.add_prompt_item"
+    bl_label = "Add Prompt"
+    bl_description = "Add a new prompt schedule item for the active character"
+
+    def execute(self, context):
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        item = char.prompt_schedule.add()
+        if len(char.prompt_schedule) == 1:
             item.start_frame = 0
         else:
             item.start_frame = context.scene.frame_current
         item.prompt = "walk"
-        props.prompt_schedule_index = len(props.prompt_schedule) - 1
+        char.prompt_schedule_index = len(char.prompt_schedule) - 1
         tag_redraw_view3d(context)
         return {'FINISHED'}
 
@@ -409,14 +749,16 @@ class CEB_OT_RemovePromptItem(bpy.types.Operator):
     bl_description = "Remove the selected prompt schedule item"
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        idx = props.prompt_schedule_index
-        if 0 <= idx < len(props.prompt_schedule):
-            item = props.prompt_schedule[idx]
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        idx = char.prompt_schedule_index
+        if 0 <= idx < len(char.prompt_schedule):
+            item = char.prompt_schedule[idx]
             remove_waypoint_empty(item)
             remove_pose_constraint_armature(item)
-            props.prompt_schedule.remove(idx)
-            props.prompt_schedule_index = max(0, idx - 1)
+            char.prompt_schedule.remove(idx)
+            char.prompt_schedule_index = max(0, idx - 1)
             tag_redraw_view3d(context)
             send_waypoints_to_bridge(context)
             send_pose_constraints_to_bridge(context)
@@ -425,22 +767,24 @@ class CEB_OT_RemovePromptItem(bpy.types.Operator):
 class CEB_OT_ClearPromptItems(bpy.types.Operator):
     bl_idname = "ceb.clear_prompt_items"
     bl_label = "Clear All Prompts"
-    bl_description = "Remove all items from the prompt schedule"
+    bl_description = "Remove all items from the active character's prompt schedule"
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        for item in props.prompt_schedule:
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        for item in char.prompt_schedule:
             remove_waypoint_empty(item)
             remove_pose_constraint_armature(item)
-        props.prompt_schedule.clear()
-        props.prompt_schedule_index = 0
+        char.prompt_schedule.clear()
+        char.prompt_schedule_index = 0
         tag_redraw_view3d(context)
         send_waypoints_to_bridge(context)
         send_pose_constraints_to_bridge(context)
-        self.report({'INFO'}, "Cleared all prompt schedule items and constraints.")
+        self.report({'INFO'}, f"Cleared prompt schedule items for {char.name}.")
         return {'FINISHED'}
 
 class CEB_OT_MovePromptItem(bpy.types.Operator):
@@ -453,15 +797,17 @@ class CEB_OT_MovePromptItem(bpy.types.Operator):
     )
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        idx = props.prompt_schedule_index
-        schedule = props.prompt_schedule
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        idx = char.prompt_schedule_index
+        schedule = char.prompt_schedule
         if self.direction == 'UP' and idx > 0:
             schedule.move(idx, idx - 1)
-            props.prompt_schedule_index -= 1
+            char.prompt_schedule_index -= 1
         elif self.direction == 'DOWN' and idx < len(schedule) - 1:
             schedule.move(idx, idx + 1)
-            props.prompt_schedule_index += 1
+            char.prompt_schedule_index += 1
         tag_redraw_view3d(context)
         return {'FINISHED'}
 
@@ -471,8 +817,10 @@ class CEB_OT_SortPromptItems(bpy.types.Operator):
     bl_description = "Reorder prompt schedule items chronologically by start frame"
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        schedule = props.prompt_schedule
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        schedule = char.prompt_schedule
         if len(schedule) <= 1:
             return {'FINISHED'}
 
@@ -503,11 +851,11 @@ class CEB_OT_SortPromptItems(bpy.types.Operator):
             new_item.has_pose_constraint = d["has_pose_constraint"]
             new_item.pose_armature_name = d["pose_armature_name"]
 
-        props.prompt_schedule_index = 0
+        char.prompt_schedule_index = 0
         tag_redraw_view3d(context)
         send_waypoints_to_bridge(context)
         send_pose_constraints_to_bridge(context)
-        self.report({'INFO'}, "Prompt schedule reordered by start frame.")
+        self.report({'INFO'}, f"Prompt schedule reordered by start frame for {char.name}.")
         return {'FINISHED'}
 
 class CEB_OT_RemoveWaypoint(bpy.types.Operator):
@@ -516,10 +864,12 @@ class CEB_OT_RemoveWaypoint(bpy.types.Operator):
     bl_description = "Remove 3D Waypoint target and delete linked Empty object"
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        idx = props.prompt_schedule_index
-        if 0 <= idx < len(props.prompt_schedule):
-            item = props.prompt_schedule[idx]
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        idx = char.prompt_schedule_index
+        if 0 <= idx < len(char.prompt_schedule):
+            item = char.prompt_schedule[idx]
             remove_waypoint_empty(item)
             item.has_waypoint = False
             tag_redraw_view3d(context)
@@ -533,15 +883,17 @@ class CEB_OT_AddPoseConstraint(bpy.types.Operator):
     bl_description = "Add a full-body pose constraint by duplicating the character armature for target posing"
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        item = props.prompt_schedule.add()
-        item.start_frame = 0 if len(props.prompt_schedule) == 1 else context.scene.frame_current
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        item = char.prompt_schedule.add()
+        item.start_frame = 0 if len(char.prompt_schedule) == 1 else context.scene.frame_current
         item.prompt = ""
         item.has_pose_constraint = True
 
-        arm_obj = get_or_create_pose_constraint_armature(context, item)
+        arm_obj = get_or_create_pose_constraint_armature(context, item, copy_current_pose=True)
 
-        props.prompt_schedule_index = len(props.prompt_schedule) - 1
+        char.prompt_schedule_index = len(char.prompt_schedule) - 1
         tag_redraw_view3d(context)
         send_pose_constraints_to_bridge(context)
 
@@ -555,16 +907,73 @@ class CEB_OT_AddPoseConstraint(bpy.types.Operator):
 
         return {'FINISHED'}
 
+class CEB_OT_CapturePoseConstraint(bpy.types.Operator):
+    bl_idname = "ceb.capture_pose_constraint"
+    bl_label = "Capture Current Pose Constraint"
+    bl_description = "Capture the selected character's current pose and set it as a pose constraint target"
+
+    def execute(self, context):
+        char = get_active_character(context)
+        if not char:
+            self.report({'ERROR'}, "No active character selected.")
+            return {'CANCELLED'}
+
+        arm_obj = None
+        if char.arm_obj_name:
+            arm_obj = bpy.data.objects.get(char.arm_obj_name)
+        if not arm_obj and context.active_object and context.active_object.type == 'ARMATURE' and not context.active_object.name.startswith("ARDY_Pose_"):
+            arm_obj = context.active_object
+        if not arm_obj:
+            clean_name = char.name.replace(" ", "_")
+            arm_obj = bpy.data.objects.get(f"{clean_name}_Armature")
+
+        if not arm_obj:
+            self.report({'WARNING'}, f"Character armature for '{char.name}' not found.")
+            return {'CANCELLED'}
+
+        idx = char.prompt_schedule_index
+        item = None
+        if 0 <= idx < len(char.prompt_schedule) and getattr(char.prompt_schedule[idx], "has_pose_constraint", False):
+            item = char.prompt_schedule[idx]
+        else:
+            item = char.prompt_schedule.add()
+            item.start_frame = context.scene.frame_current
+            item.prompt = ""
+            item.has_pose_constraint = True
+            char.prompt_schedule_index = len(char.prompt_schedule) - 1
+
+        pose_arm = get_or_create_pose_constraint_armature(context, item, copy_current_pose=True)
+
+        if pose_arm and arm_obj.pose and pose_arm.pose:
+            pose_arm.matrix_world = arm_obj.matrix_world.copy()
+            for src_bone in arm_obj.pose.bones:
+                tgt_bone = pose_arm.pose.bones.get(src_bone.name)
+                if tgt_bone:
+                    tgt_bone.rotation_mode = src_bone.rotation_mode
+                    tgt_bone.location = src_bone.location.copy()
+                    tgt_bone.rotation_quaternion = src_bone.rotation_quaternion.copy()
+                    tgt_bone.rotation_euler = src_bone.rotation_euler.copy()
+                    tgt_bone.rotation_axis_angle = list(src_bone.rotation_axis_angle)
+                    tgt_bone.scale = src_bone.scale.copy()
+
+        tag_redraw_view3d(context)
+        send_pose_constraints_to_bridge(context)
+
+        self.report({'INFO'}, f"Captured pose of '{char.name}' as constraint at frame {item.start_frame}")
+        return {'FINISHED'}
+
 class CEB_OT_RemovePoseConstraint(bpy.types.Operator):
     bl_idname = "ceb.remove_pose_constraint"
     bl_label = "Remove Pose Constraint"
     bl_description = "Remove full-body Pose Constraint target and delete linked ghost armature object"
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        idx = props.prompt_schedule_index
-        if 0 <= idx < len(props.prompt_schedule):
-            item = props.prompt_schedule[idx]
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        idx = char.prompt_schedule_index
+        if 0 <= idx < len(char.prompt_schedule):
+            item = char.prompt_schedule[idx]
             remove_pose_constraint_armature(item)
             item.has_pose_constraint = False
             tag_redraw_view3d(context)
@@ -580,15 +989,15 @@ class CEB_OT_SelectPromptItem(bpy.types.Operator):
     index: bpy.props.IntProperty(default=0)
 
     def execute(self, context):
-        props = context.scene.ceb_ardy
-        if 0 <= self.index < len(props.prompt_schedule):
-            props.prompt_schedule_index = self.index
-            item = props.prompt_schedule[self.index]
+        char = get_active_character(context)
+        if not char:
+            return {'CANCELLED'}
+        if 0 <= self.index < len(char.prompt_schedule):
+            char.prompt_schedule_index = self.index
+            item = char.prompt_schedule[self.index]
             
-            # Jump timeline cursor to start frame
             context.scene.frame_set(item.start_frame)
             
-            # Select linked Empty object or Pose Armature in 3D View if present
             if getattr(item, "has_waypoint", False) and getattr(item, "waypoint_object_name", ""):
                 obj = bpy.data.objects.get(item.waypoint_object_name)
                 if obj:
@@ -610,7 +1019,9 @@ def get_or_create_waypoint_empty(context, item):
     obj = bpy.data.objects.get(obj_name) if obj_name else None
     
     if not obj:
-        base_name = f"ARDY_Waypoint_F{item.start_frame}"
+        char = get_active_character(context)
+        prefix = get_char_prefix(char)
+        base_name = f"{prefix}_Ardy_waypoint_F{item.start_frame}"
         obj_name = base_name
         idx = 1
         while bpy.data.objects.get(obj_name):
@@ -640,18 +1051,19 @@ def ardy_depsgraph_sync_waypoints(scene, depsgraph=None):
     if not hasattr(scene, "ceb_ardy"):
         return
     props = scene.ceb_ardy
-    for item in props.prompt_schedule:
-        if item.has_waypoint and item.waypoint_object_name:
-            obj = bpy.data.objects.get(item.waypoint_object_name)
-            if obj:
-                loc_vec = mathutils.Vector(item.waypoint_co)
-                if (obj.location - loc_vec).length > 1e-4:
-                    item.waypoint_co = obj.location
+    for char in props.characters:
+        for item in char.prompt_schedule:
+            if item.has_waypoint and item.waypoint_object_name:
+                obj = bpy.data.objects.get(item.waypoint_object_name)
+                if obj:
+                    loc_vec = mathutils.Vector(item.waypoint_co)
+                    if (obj.location - loc_vec).length > 1e-4:
+                        item.waypoint_co = obj.location
 
 class CEB_OT_AddWaypoint(bpy.types.Operator):
     bl_idname = "ceb.add_waypoint"
     bl_label = "Add Waypoint in 3D View"
-    bl_description = "Click in the 3D Viewport to place a new Waypoint at the target location"
+    bl_description = "Click in the 3D Viewport to place a new Waypoint for the active character"
 
     def modal(self, context, event):
         context.area.tag_redraw()
@@ -666,27 +1078,27 @@ class CEB_OT_AddWaypoint(bpy.types.Operator):
             origin = region_2d_to_origin_3d(region, rv3d, coord)
             direction = region_2d_to_vector_3d(region, rv3d, coord)
 
-            # Raycast onto ground plane Z=0
             if abs(direction.z) > 1e-6:
                 t = -origin.z / direction.z
                 target_co = origin + t * direction
             else:
                 target_co = region_2d_to_location_3d(region, rv3d, coord, (0, 0, 0))
 
-            props = context.scene.ceb_ardy
-            item = props.prompt_schedule.add()
-            item.start_frame = 0 if len(props.prompt_schedule) == 1 else context.scene.frame_current
+            char = get_active_character(context)
+            if not char:
+                return {'CANCELLED'}
+            item = char.prompt_schedule.add()
+            item.start_frame = 0 if len(char.prompt_schedule) == 1 else context.scene.frame_current
             item.prompt = ""
             item.has_waypoint = True
             item.waypoint_co = target_co
 
-            # Spawn Blender Empty object for native control
             get_or_create_waypoint_empty(context, item)
 
-            props.prompt_schedule_index = len(props.prompt_schedule) - 1
+            char.prompt_schedule_index = len(char.prompt_schedule) - 1
             tag_redraw_view3d(context)
             send_waypoints_to_bridge(context)
-            self.report({'INFO'}, f"Placed Waypoint at ({target_co.x:.2f}, {target_co.y:.2f}, {target_co.z:.2f})")
+            self.report({'INFO'}, f"Placed Waypoint for {char.name} at ({target_co.x:.2f}, {target_co.y:.2f}, {target_co.z:.2f})")
             return {'FINISHED'}
 
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -750,34 +1162,51 @@ def draw_waypoints_3d_view(self, context):
     except Exception:
         pass
 
-    for item in props.prompt_schedule:
-        if not item.enabled or not getattr(item, "has_waypoint", False):
-            continue
+    chars_to_draw = []
+    if props.overlay_view_mode == 'SELECTED':
+        active_c = get_active_character(context)
+        if active_c:
+            chars_to_draw.append(active_c)
+    else:
+        chars_to_draw = list(props.characters)
 
-        co = mathutils.Vector(item.waypoint_co)
-        ground_co = mathutils.Vector((co.x, co.y, 0.0))
-        top_co = mathutils.Vector((co.x, co.y, co.z + 0.6))
+    palette = [
+        (0.0, 0.85, 1.0, 0.9),
+        (1.0, 0.45, 0.2, 0.9),
+        (0.2, 0.95, 0.4, 0.9),
+        (0.9, 0.3, 0.9, 0.9),
+    ]
 
-        vertices = [(ground_co.x, ground_co.y, ground_co.z), (top_co.x, top_co.y, top_co.z)]
-        
-        shader.uniform_float("color", (0.0, 0.85, 1.0, 0.9))
-        batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
-        batch.draw(shader)
+    for c_idx, char in enumerate(chars_to_draw):
+        color = palette[c_idx % len(palette)]
+        for item in char.prompt_schedule:
+            if not item.enabled or not getattr(item, "has_waypoint", False):
+                continue
 
-        region = context.region
-        rv3d = context.region_data
-        if region and rv3d:
-            from bpy_extras.view3d_utils import location_3d_to_region_2d
-            screen_pos = location_3d_to_region_2d(region, rv3d, top_co)
-            if screen_pos:
-                lbl_text = f"📍 F{item.start_frame}: Waypoint ({co.x:.1f}, {co.y:.1f}, {co.z:.1f})"
-                try:
-                    blf.size(font_id, 11)
-                    blf.color(font_id, 0.0, 0.95, 1.0, 1.0)
-                    blf.position(font_id, int(screen_pos.x) + 8, int(screen_pos.y) + 4, 0)
-                    blf.draw(font_id, lbl_text)
-                except Exception:
-                    pass
+            co = mathutils.Vector(item.waypoint_co)
+            ground_co = mathutils.Vector((co.x, co.y, 0.0))
+            top_co = mathutils.Vector((co.x, co.y, co.z + 0.6))
+
+            vertices = [(ground_co.x, ground_co.y, ground_co.z), (top_co.x, top_co.y, top_co.z)]
+            
+            shader.uniform_float("color", color)
+            batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
+            batch.draw(shader)
+
+            region = context.region
+            rv3d = context.region_data
+            if region and rv3d:
+                from bpy_extras.view3d_utils import location_3d_to_region_2d
+                screen_pos = location_3d_to_region_2d(region, rv3d, top_co)
+                if screen_pos:
+                    lbl_text = f"📍 [{char.name}] F{item.start_frame}: Waypoint ({co.x:.1f}, {co.y:.1f}, {co.z:.1f})"
+                    try:
+                        blf.size(font_id, 11)
+                        blf.color(font_id, color[0], color[1], color[2], 1.0)
+                        blf.position(font_id, int(screen_pos.x) + 8, int(screen_pos.y) + 4, 0)
+                        blf.draw(font_id, lbl_text)
+                    except Exception:
+                        pass
 
 def draw_prompt_overlay_px(self, context):
     if context is None:
@@ -792,127 +1221,132 @@ def draw_prompt_overlay_px(self, context):
     if not region or region.width < 100 or region.height < 100:
         return
 
+    chars_to_draw = []
+    if props.overlay_view_mode == 'SELECTED':
+        c = get_active_character(context)
+        if c:
+            chars_to_draw.append(c)
+    else:
+        chars_to_draw = list(props.characters)
+
+    if not chars_to_draw:
+        return
+
     current_frame = context.scene.frame_current
     scene_start = context.scene.frame_start
     scene_end = context.scene.frame_end
     
-    sorted_schedule = sorted(props.prompt_schedule, key=lambda x: x.start_frame)
-    enabled_schedule = [item for item in sorted_schedule if item.enabled]
-
-    if not enabled_schedule and not props.realtime_prompt:
-        return
-
-    active_item = None
-    active_prompt_text = props.realtime_prompt if props.realtime_prompt else "None"
-    
-    for item in sorted_schedule:
-        if item.enabled and current_frame >= item.start_frame:
-            active_item = item
-            active_prompt_text = item.prompt
-
-    max_sched_frame = max([item.start_frame for item in sorted_schedule], default=scene_end)
-    frame_min = scene_start
-    frame_max = max(scene_end, max_sched_frame + 20)
-    total_frames = max(1, frame_max - frame_min)
-
     font_id = 0
-
     card_w = min(680, max(380, int(region.width * 0.65)))
     card_h = 108
+    base_y = 35
 
-    x = int((region.width - card_w) / 2)
-    y = 35
+    for c_idx, char in enumerate(chars_to_draw):
+        y = base_y + c_idx * (card_h + 10)
+        sorted_schedule = sorted(char.prompt_schedule, key=lambda x: x.start_frame)
+        enabled_schedule = [item for item in sorted_schedule if item.enabled]
 
-    try:
-        gpu.state.blend_set('ALPHA')
-    except Exception:
-        pass
+        if not enabled_schedule and not char.realtime_prompt:
+            continue
 
-    # Background card
-    draw_round_rect_2d(x, y, card_w, card_h, (0.08, 0.10, 0.15, 0.88))
-    # Top accent line
-    draw_round_rect_2d(x, y + card_h - 4, card_w, 4, (0.15, 0.65, 0.95, 0.9))
+        active_item = None
+        active_prompt_text = char.realtime_prompt if char.realtime_prompt else "None"
+        
+        for item in sorted_schedule:
+            if item.enabled and current_frame >= item.start_frame:
+                active_item = item
+                active_prompt_text = item.prompt
 
-    # Header text
-    try:
-        blf.size(font_id, 10)
-        blf.color(font_id, 0.55, 0.65, 0.75, 1.0)
-        blf.position(font_id, x + 16, y + card_h - 22, 0)
-        blf.draw(font_id, "PROMPT TIMELINE")
-    except Exception:
-        pass
+        max_sched_frame = max([item.start_frame for item in sorted_schedule], default=scene_end)
+        frame_min = scene_start
+        frame_max = max(scene_end, max_sched_frame + 20)
+        total_frames = max(1, frame_max - frame_min)
 
-    active_str = f"► Active: \"{active_prompt_text}\" (Frame {current_frame})"
-    try:
-        blf.size(font_id, 12)
-        blf.color(font_id, 0.2, 0.95, 0.45, 1.0)
-        blf.position(font_id, x + 140, y + card_h - 22, 0)
-        blf.draw(font_id, active_str)
-    except Exception:
-        pass
+        x = int((region.width - card_w) / 2)
 
-    # Timeline track
-    track_padding = 16
-    track_x = x + track_padding
-    track_w = card_w - (track_padding * 2)
-    track_y = y + 44
-    track_h = 18
+        try:
+            gpu.state.blend_set('ALPHA')
+        except Exception:
+            pass
 
-    draw_round_rect_2d(track_x, track_y, track_w, track_h, (0.15, 0.18, 0.24, 0.9))
+        draw_round_rect_2d(x, y, card_w, card_h, (0.08, 0.10, 0.15, 0.88))
+        draw_round_rect_2d(x, y + card_h - 4, card_w, 4, (0.15, 0.65, 0.95, 0.9))
 
-    def frame_to_x(f):
-        norm = (f - frame_min) / total_frames
-        norm = max(0.0, min(1.0, norm))
-        return track_x + norm * track_w
+        try:
+            blf.size(font_id, 10)
+            blf.color(font_id, 0.55, 0.65, 0.75, 1.0)
+            blf.position(font_id, x + 16, y + card_h - 22, 0)
+            blf.draw(font_id, f"PROMPT TIMELINE ({char.name})")
+        except Exception:
+            pass
 
-    # Prompt blocks & markers
-    if sorted_schedule:
-        for i, item in enumerate(sorted_schedule):
-            f_start = item.start_frame
-            f_end = sorted_schedule[i + 1].start_frame if i + 1 < len(sorted_schedule) else frame_max
+        active_str = f"► Active: \"{active_prompt_text}\" (Frame {current_frame})"
+        try:
+            blf.size(font_id, 12)
+            blf.color(font_id, 0.2, 0.95, 0.45, 1.0)
+            blf.position(font_id, x + 240, y + card_h - 22, 0)
+            blf.draw(font_id, active_str)
+        except Exception:
+            pass
 
-            x1 = frame_to_x(f_start)
-            x2 = frame_to_x(f_end)
-            seg_w = max(2.0, x2 - x1)
+        track_padding = 16
+        track_x = x + track_padding
+        track_w = card_w - (track_padding * 2)
+        track_y = y + 44
+        track_h = 18
 
-            is_active = (item == active_item)
-            if is_active:
-                col = (0.1, 0.75, 0.95, 0.85) if item.enabled else (0.4, 0.5, 0.6, 0.5)
-            else:
-                col = (0.22, 0.32, 0.45, 0.7) if item.enabled else (0.14, 0.16, 0.2, 0.4)
+        draw_round_rect_2d(track_x, track_y, track_w, track_h, (0.15, 0.18, 0.24, 0.9))
 
-            draw_round_rect_2d(int(x1), track_y + 2, int(seg_w), track_h - 4, col)
-            draw_round_rect_2d(int(x1), track_y - 2, 2, track_h + 4, (1.0, 1.0, 1.0, 0.8 if item.enabled else 0.3))
+        def frame_to_x(f):
+            norm = (f - frame_min) / total_frames
+            norm = max(0.0, min(1.0, norm))
+            return track_x + norm * track_w
 
-            if getattr(item, "has_waypoint", False):
-                # Draw glowing diamond pin indicator on timeline track
-                px_center = int(x1)
-                py_center = track_y + track_h // 2
-                draw_round_rect_2d(px_center - 3, py_center - 4, 6, 8, (0.0, 0.95, 1.0, 1.0))
-                lbl_str = f"📍 F{f_start}: {item.prompt}"
-            else:
-                lbl_str = f"F{f_start}: {item.prompt}"
+        if sorted_schedule:
+            for i, item in enumerate(sorted_schedule):
+                f_start = item.start_frame
+                f_end = sorted_schedule[i + 1].start_frame if i + 1 < len(sorted_schedule) else frame_max
 
-            try:
-                blf.size(font_id, 10)
+                x1 = frame_to_x(f_start)
+                x2 = frame_to_x(f_end)
+                seg_w = max(2.0, x2 - x1)
+
+                is_active = (item == active_item)
                 if is_active:
-                    blf.color(font_id, 1.0, 0.85, 0.3, 1.0)
-                elif item.enabled:
-                    blf.color(font_id, 0.8, 0.85, 0.9, 0.9)
+                    col = (0.1, 0.75, 0.95, 0.85) if item.enabled else (0.4, 0.5, 0.6, 0.5)
                 else:
-                    blf.color(font_id, 0.5, 0.5, 0.5, 0.6)
+                    col = (0.22, 0.32, 0.45, 0.7) if item.enabled else (0.14, 0.16, 0.2, 0.4)
 
-                lbl_w, _ = blf.dimensions(font_id, lbl_str)
-                lbl_x = max(track_x, min(int(x1), track_x + track_w - int(lbl_w)))
-                blf.position(font_id, lbl_x, y + 22, 0)
-                blf.draw(font_id, lbl_str)
-            except Exception:
-                pass
+                draw_round_rect_2d(int(x1), track_y + 2, int(seg_w), track_h - 4, col)
+                draw_round_rect_2d(int(x1), track_y - 2, 2, track_h + 4, (1.0, 1.0, 1.0, 0.8 if item.enabled else 0.3))
 
-    # Playhead needle
-    playhead_x = int(frame_to_x(current_frame))
-    draw_round_rect_2d(playhead_x - 1, track_y - 6, 3, track_h + 12, (1.0, 0.55, 0.1, 1.0))
-    draw_round_rect_2d(playhead_x - 4, track_y + track_h + 4, 9, 6, (1.0, 0.65, 0.15, 1.0))
+                if getattr(item, "has_waypoint", False):
+                    px_center = int(x1)
+                    py_center = track_y + track_h // 2
+                    draw_round_rect_2d(px_center - 3, py_center - 4, 6, 8, (0.0, 0.95, 1.0, 1.0))
+                    lbl_str = f"📍 F{f_start}: {item.prompt}"
+                else:
+                    lbl_str = f"F{f_start}: {item.prompt}"
+
+                try:
+                    blf.size(font_id, 10)
+                    if is_active:
+                        blf.color(font_id, 1.0, 0.85, 0.3, 1.0)
+                    elif item.enabled:
+                        blf.color(font_id, 0.8, 0.85, 0.9, 0.9)
+                    else:
+                        blf.color(font_id, 0.5, 0.5, 0.5, 0.6)
+
+                    lbl_w, _ = blf.dimensions(font_id, lbl_str)
+                    lbl_x = max(track_x, min(int(x1), track_x + track_w - int(lbl_w)))
+                    blf.position(font_id, lbl_x, y + 22, 0)
+                    blf.draw(font_id, lbl_str)
+                except Exception:
+                    pass
+
+        playhead_x = int(frame_to_x(current_frame))
+        draw_round_rect_2d(playhead_x - 1, track_y - 6, 3, track_h + 12, (1.0, 0.55, 0.1, 1.0))
+        draw_round_rect_2d(playhead_x - 4, track_y + track_h + 4, 9, 6, (1.0, 0.65, 0.15, 1.0))
 
     try:
         gpu.state.blend_set('NONE')
@@ -926,14 +1360,16 @@ def ardy_frame_change_handler(scene):
     props = scene.ceb_ardy
     current_frame = scene.frame_current
     
-    sorted_schedule = sorted([item for item in props.prompt_schedule if item.enabled], key=lambda x: x.start_frame)
-    active_prompt = None
-    for item in sorted_schedule:
-        if current_frame >= item.start_frame:
-            active_prompt = item.prompt
-            
-    if active_prompt and active_prompt != props.realtime_prompt:
-        props.realtime_prompt = active_prompt
+    char = get_active_character()
+    if char:
+        sorted_schedule = sorted([item for item in char.prompt_schedule if item.enabled], key=lambda x: x.start_frame)
+        active_prompt = None
+        for item in sorted_schedule:
+            if current_frame >= item.start_frame:
+                active_prompt = item.prompt
+                
+        if active_prompt and active_prompt != char.realtime_prompt:
+            char.realtime_prompt = active_prompt
 
     tag_redraw_view3d()
 
@@ -1045,7 +1481,7 @@ def get_skin_path(paths, J):
         rel = os.path.join("ardy", "assets", "skeletons", "somaskel77", "skin_standard.npz")
     return os.path.join(paths["ardy_dir"], rel)
 
-def setup_soma_skin(context, parent_obj, J, scale, paths):
+def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None):
     try:
         import numpy as np
     except ImportError:
@@ -1072,11 +1508,11 @@ def setup_soma_skin(context, parent_obj, J, scale, paths):
     
     parent_obj.rotation_euler = (0, 0, 0)
 
-    prefix = "Core" if J == 27 else "SOMA"
+    clean_prefix = char_name.replace(" ", "_") if char_name else ("Core" if J == 27 else "SOMA")
 
     # 1. Create Mesh
-    mesh_data = bpy.data.meshes.new(name=f"{prefix}_Skin_Mesh")
-    mesh_obj = bpy.data.objects.new(f"{prefix}_Skin", mesh_data)
+    mesh_data = bpy.data.meshes.new(name=f"{clean_prefix}_Skin_Mesh")
+    mesh_obj = bpy.data.objects.new(f"{clean_prefix}_Skin", mesh_data)
     context.scene.collection.objects.link(mesh_obj)
     
     verts = [tuple(ardy_pos_to_blender(v, scale)) for v in bind_vertices]
@@ -1087,13 +1523,13 @@ def setup_soma_skin(context, parent_obj, J, scale, paths):
     mesh_obj.parent = parent_obj
     
     # 2. Create Armature
-    arm_data = bpy.data.armatures.new(f"{prefix}_Armature_Data")
-    arm_obj = bpy.data.objects.new(f"{prefix}_Armature", arm_data)
+    arm_data = bpy.data.armatures.new(f"{clean_prefix}_Armature_Data")
+    arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
     context.scene.collection.objects.link(arm_obj)
     arm_obj.parent = parent_obj
     
     # Add Armature Modifier
-    arm_mod = mesh_obj.modifiers.new(name=f"{prefix}_Armature_Mod", type='ARMATURE')
+    arm_mod = mesh_obj.modifiers.new(name=f"{clean_prefix}_Armature_Mod", type='ARMATURE')
     arm_mod.object = arm_obj
     
     # 3. Create EditBones anchored to exact joint heads and tails
@@ -1162,6 +1598,52 @@ def setup_soma_skin(context, parent_obj, J, scale, paths):
                 
     return arm_obj, rig_joint_names
 
+
+def apply_relaxed_idle_pose(arm_obj):
+    """
+    Apply a natural relaxed idle pose to an ARDY armature after loading.
+    Rotates the upper arms down from the default T-pose to a comfortable
+    at-the-sides position, matching what the ARDY viser web app displays
+    as the initial idle/neutral state.
+
+    The cskel27 arm bones are oriented with local Y along the bone chain
+    and local X pointing "up" in the bind pose, so rotating around local X
+    swings the arms downward (positive X = down for RightArm, negative X for LeftArm).
+
+    Only affects pose bones – does not create any keyframes.
+    """
+    import math
+
+    # Maps: bone_name -> (axis, angle_degrees) in LOCAL bone space.
+    # Y runs along the bone; X is perpendicular and controls up/down swing.
+    # Positive X on RightArm swings it downward; negative X on LeftArm swings it downward.
+    RELAXED_ROTATIONS = {
+        # Right arm chain
+        # "RightShoulder":  ('X',  10.0),   # slight downward roll at shoulder
+        "RightArm":       ('X',  -80.0),   # swing upper arm down alongside body
+        # "RightForeArm":   ('Z',   5.0),   # subtle elbow bend outward
+        # Left arm chain (local X is mirrored, so positive = down here too)
+        # "LeftShoulder":   ('X',  10.0),   # slight downward roll at shoulder
+        "LeftArm":        ('X',  -80.0),   # swing upper arm down alongside body
+        # "LeftForeArm":    ('Z',  -5.0),   # subtle elbow bend outward
+    }
+
+    if arm_obj is None or arm_obj.type != 'ARMATURE':
+        return
+
+    for bone_name, (axis, angle_deg) in RELAXED_ROTATIONS.items():
+        pbone = arm_obj.pose.bones.get(bone_name)
+        if pbone is None:
+            continue
+        pbone.rotation_mode = 'XYZ'
+        angle_rad = math.radians(angle_deg)
+        rot = [0.0, 0.0, 0.0]
+        rot["XYZ".index(axis)] = angle_rad
+        pbone.rotation_euler = mathutils.Euler(rot, 'XYZ')
+
+
+
+
 def apply_soma_pose(arm_obj, rig_joint_names, bind_rig_transform,
                     joints_t, rot_mats_t, s77_to_s30, J, scale,
                     record_keys=False, frame_num=0):
@@ -1170,6 +1652,7 @@ def apply_soma_pose(arm_obj, rig_joint_names, bind_rig_transform,
     Root bone (Hips) translates and rotates; child bones use pure local quaternions with zero translation noise.
     Pre-calculates target rotation matrices for all joints in the frame to avoid reading stale bone.parent.matrix.
     """
+
     num_joints = len(rig_joint_names)
     name_to_idx = {name: idx for idx, name in enumerate(rig_joint_names)}
 
@@ -1212,7 +1695,7 @@ def apply_soma_pose(arm_obj, rig_joint_names, bind_rig_transform,
         is_root = (j_idx == 0 or bone.parent is None)
 
         if is_root:
-            target_matrix = posed_mat_b @ bind_mat_b.inverted() @ bone.bone.matrix_local
+            target_matrix = arm_obj.matrix_world.inverted() @ posed_mat_b @ bind_mat_b.inverted() @ bone.bone.matrix_local
             bone.matrix = target_matrix
         else:
             bone.rotation_mode = 'QUATERNION'
@@ -1494,29 +1977,44 @@ class CEB_OT_ArdyImportNPZ(bpy.types.Operator, ImportHelper):
 class CEB_OT_CleanAnimation(bpy.types.Operator):
     bl_idname = "ceb.clean_animation"
     bl_label = "Clean Animation"
-    bl_description = "Clear all keyframes and animation data from the selected ARDY character armature"
+    bl_description = "Clear all keyframes and animation data from the active or selected ARDY character armature"
 
     def execute(self, context):
         target_arms = []
-        # 1. Check active object first (excluding pose constraint ghost armatures)
-        active = context.active_object
-        if active and active.type == 'ARMATURE' and not active.name.startswith("ARDY_Pose_"):
-            target_arms.append(active)
-            
-        # 2. Check selected objects
-        for obj in context.selected_objects:
-            if obj.type == 'ARMATURE' and not obj.name.startswith("ARDY_Pose_") and obj not in target_arms:
-                target_arms.append(obj)
-                
-        # 3. If no character armature selected, fall back to canonical ARDY character armatures in scene
+        
+        # 1. Check character selection list first (active character from UI list)
+        char = get_active_character(context)
+        if char:
+            clean_name = char.name.replace(" ", "_")
+            arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
+            arm_obj = bpy.data.objects.get(arm_name)
+            if arm_obj:
+                target_arms.append(arm_obj)
+
+        # 2. Fallback: Check active object in Viewport (excluding pose constraint ghost armatures)
         if not target_arms:
-            for arm_name in ["Core_Armature", "SOMA_Armature"]:
+            active = context.active_object
+            if active and active.type == 'ARMATURE' and not active.name.startswith("ARDY_Pose_"):
+                target_arms.append(active)
+            
+        # 3. Fallback: Check selected objects in Viewport
+        if not target_arms:
+            for obj in context.selected_objects:
+                if obj.type == 'ARMATURE' and not obj.name.startswith("ARDY_Pose_") and obj not in target_arms:
+                    target_arms.append(obj)
+                
+        # 4. Fallback: check all characters in character selection list
+        if not target_arms:
+            props = context.scene.ceb_ardy
+            for char in props.characters:
+                clean_name = char.name.replace(" ", "_")
+                arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
                 arm_obj = bpy.data.objects.get(arm_name)
                 if arm_obj and arm_obj not in target_arms:
                     target_arms.append(arm_obj)
 
         if not target_arms:
-            self.report({'WARNING'}, "No ARDY character armature selected or found in scene.")
+            self.report({'WARNING'}, "No ARDY character armature selected or found for the active character.")
             return {'CANCELLED'}
 
         for arm_obj in target_arms:
@@ -1534,21 +2032,33 @@ class CEB_OT_CleanAnimation(bpy.types.Operator):
             arm_obj.rotation_euler = (0, 0, 0)
             arm_obj.scale = (1, 1, 1)
 
-            # Reset parent empty position & transform if attached
-            if arm_obj.parent:
-                arm_obj.parent.location = (0, 0, 0)
-                arm_obj.parent.rotation_euler = (0, 0, 0)
-                arm_obj.parent.scale = (1, 1, 1)
+            # Apply relaxed idle pose (arms down) so the character looks natural after clean
+            apply_relaxed_idle_pose(arm_obj)
+            
+            # Also clear animation data on parent & mesh objects if linked
+            if arm_obj.parent and arm_obj.parent.animation_data:
+                arm_obj.parent.animation_data_clear()
+
+
+        # Check active character to clear associated mesh/parent animation data
+        char = get_active_character(context)
+        if char:
+            for o_name in (char.mesh_obj_name, char.parent_obj_name):
+                if o_name:
+                    o = bpy.data.objects.get(o_name)
+                    if o and o.animation_data:
+                        o.animation_data_clear()
 
         context.scene.frame_current = 1
         tag_redraw_view3d(context)
 
-        # Clear queued frames from realtime stream operator if running
+        # Clear queued frames from realtime stream operator if running & reset start_frame to 1
         global _active_stream_operator
         CEB_OT_ArdyRealtimeStream._frame_queue = []
         if _active_stream_operator is not None:
             _active_stream_operator._frame_queue = []
             _active_stream_operator._buffer = ""
+            _active_stream_operator._start_frame = 1
 
         # Send RESET signal to real-time bridge server if connected or reachable
         global _realtime_client, _realtime_running
@@ -1556,6 +2066,13 @@ class CEB_OT_CleanAnimation(bpy.types.Operator):
         if _realtime_client and _realtime_running:
             try:
                 _realtime_client.sendall(b"RESET\n")
+                if char:
+                    active_prompt = get_active_prompt_for_frame(context.scene.ceb_ardy, 1, context=context)
+                    char_x, char_y, char_z, char_heading = get_character_world_transform(char)
+                    switch_cmd = f"SWITCH_CHAR:{char.name}:{char.model}:{active_prompt}:1:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}\n"
+                    _realtime_client.sendall(switch_cmd.encode("utf-8"))
+                    send_waypoints_to_bridge(context, start_frame=1)
+                    send_pose_constraints_to_bridge(context, start_frame=1)
                 sent = True
             except Exception as e:
                 print(f"[CEB Ardy] Failed to send RESET command over socket: {e}")
@@ -1575,10 +2092,69 @@ class CEB_OT_CleanAnimation(bpy.types.Operator):
         self.report({'INFO'}, f"Cleaned animation data & reset bridge position for: {arm_names}")
         return {'FINISHED'}
 
+class CEB_OT_LoadCharacter(bpy.types.Operator):
+    bl_idname = "ceb.load_character"
+    bl_label = "Load Character"
+    bl_description = "Load (or reload) the ARDY character mesh and armature for the active character into the scene"
+
+    def execute(self, context):
+        paths, err = get_ardy_paths(context)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+
+        try:
+            import numpy as np
+        except ImportError:
+            self.report({'ERROR'}, "NumPy is not available in Blender's Python environment.")
+            return {'CANCELLED'}
+
+        char = get_active_character(context)
+        if not char:
+            self.report({'ERROR'}, "No active character selected.")
+            return {'CANCELLED'}
+
+        props = context.scene.ceb_ardy
+        scale = props.import_scale
+
+        J = 27 if char.model == 'core' else 77
+        char_name = char.name
+        clean_prefix = char_name.replace(" ", "_")
+        arm_name = f"{clean_prefix}_Armature"
+        mesh_name = f"{clean_prefix}_Skin"
+        parent_name = f"ARDY_Character_{clean_prefix}"
+
+        for obj_name in (arm_name, mesh_name):
+            obj = bpy.data.objects.get(obj_name)
+            if obj:
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        parent_obj = bpy.data.objects.get(parent_name)
+        if not parent_obj:
+            parent_obj = bpy.data.objects.new(parent_name, None)
+            context.scene.collection.objects.link(parent_obj)
+            parent_obj.rotation_euler = (0, 0, 0)
+
+        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name)
+        if not arm_obj:
+            self.report({'ERROR'}, f"Failed to build mesh and armature for {char.name}.")
+            return {'CANCELLED'}
+
+        # Apply relaxed idle pose so the character looks natural (not T-pose) on load
+        apply_relaxed_idle_pose(arm_obj)
+
+        char.arm_obj_name = arm_obj.name
+        char.mesh_obj_name = f"{clean_prefix}_Skin"
+        char.parent_obj_name = parent_obj.name
+
+        self.report({'INFO'}, f"Character loaded: {arm_obj.name} ({J} joints, scale={scale})")
+        return {'FINISHED'}
+
+
 class CEB_OT_ArdyStartBridge(bpy.types.Operator):
     bl_idname = "ceb.ardy_start_bridge"
     bl_label = "Start Bridge Process"
-    bl_description = "Start the ARDY real-time bridge process in a new console window"
+    bl_description = "Start the ARDY real-time bridge process in a new console window for the active character"
 
     def execute(self, context):
         paths, err = get_ardy_paths(context)
@@ -1592,7 +2168,10 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
             return {'CANCELLED'}
 
         props = context.scene.ceb_ardy
-        cmd = [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", props.model]
+        char = get_active_character(context)
+        model = char.model if char else 'core'
+
+        cmd = [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", model]
         if props.quantize_4bit:
             cmd.append("--quantize-4bit")
 
@@ -1602,7 +2181,7 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
                 cwd=paths["ardy_dir"],
                 creationflags=0x00000010  # CREATE_NEW_CONSOLE
             )
-            self.report({'INFO'}, f"Starting ARDY real-time bridge{' (4-bit quantization)' if props.quantize_4bit else ''}...")
+            self.report({'INFO'}, f"Starting ARDY real-time bridge for {char.name if char else 'active character'} (Model: {model.upper()}, Port: {props.realtime_port})...")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to start bridge process: {e}")
             return {'CANCELLED'}
@@ -1629,7 +2208,6 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             import socket
             import json
             
-            # 1. Read socket data into buffer and parse complete JSON frame packets into queue
             try:
                 data = _realtime_client.recv(8192)
                 if data:
@@ -1655,27 +2233,27 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 self.cleanup(context)
                 return {'CANCELLED'}
 
-            # Check for prompt schedule updates for current frame
             props = context.scene.ceb_ardy
             current_frame = context.scene.frame_current
+            char = get_active_character(context)
             active_prompt = get_active_prompt_for_frame(props, current_frame)
-            if hasattr(self, "_last_sent_prompt") and self._last_sent_prompt != active_prompt:
+            if char and hasattr(self, "_last_sent_prompt") and self._last_sent_prompt != active_prompt:
                 try:
-                    props.realtime_prompt = active_prompt
+                    char.realtime_prompt = active_prompt
                     prompt_cmd = f"PROMPT:{active_prompt}\n"
                     _realtime_client.sendall(prompt_cmd.encode("utf-8"))
                     self._last_sent_prompt = active_prompt
+                    if len(self._frame_queue) > 3:
+                        self._frame_queue = self._frame_queue[:3]
                     print(f"[CEB Ardy Stream] Prompt updated at frame {current_frame} → '{active_prompt}'")
                 except Exception as pe:
                     print(f"[CEB Ardy Stream] Error sending prompt update: {pe}")
 
-            # 2. Process frames from the unimported motion data buffer
             if self._frame_queue:
-                # Dynamic catch-up if buffer builds up significantly (> 20 or > 40 frames)
                 frames_to_process = 1
-                if len(self._frame_queue) > 40:
+                if len(self._frame_queue) > 20:
                     frames_to_process = 3
-                elif len(self._frame_queue) > 20:
+                elif len(self._frame_queue) > 8:
                     frames_to_process = 2
 
                 for _ in range(frames_to_process):
@@ -1685,7 +2263,8 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                     joints = payload.get("joints", [])
                     frame_num = payload.get("frame", 0)
                     global_rot_mats = payload.get("global_rot_mats", None)
-                    self.update_viewport(context, joints, frame_num, global_rot_mats=global_rot_mats)
+                    char_name = payload.get("char_name", None)
+                    self.update_viewport(context, joints, frame_num, global_rot_mats=global_rot_mats, char_name=char_name)
 
         return {'PASS_THROUGH'}
 
@@ -1713,15 +2292,19 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             self._frame_queue = []
             
             current_frame = context.scene.frame_current
-            active_prompt = get_active_prompt_for_frame(props, current_frame)
-            props.realtime_prompt = active_prompt
+            self._start_frame = current_frame
+            char = get_active_character(context)
+            active_prompt = get_active_prompt_for_frame(props, current_frame, context=context)
+            if char:
+                char.realtime_prompt = active_prompt
             self._last_sent_prompt = active_prompt
 
-            # Send initial model, prompt, and current frame in Blender
-            initial_cmd = f"MODEL:{props.model}\nPROMPT:{active_prompt}\nFRAME:{current_frame}\n"
+            model = char.model if char else 'core'
+            char_x, char_y, char_z, char_heading = get_character_world_transform(char)
+            initial_cmd = f"SWITCH_CHAR:{char.name if char else 'Character_1'}:{model}:{active_prompt}:{current_frame}:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}\n"
             _realtime_client.sendall(initial_cmd.encode("utf-8"))
-            send_waypoints_to_bridge(context)
-            send_pose_constraints_to_bridge(context)
+            send_waypoints_to_bridge(context, start_frame=current_frame)
+            send_pose_constraints_to_bridge(context, start_frame=current_frame)
         except Exception as e:
             self.report({'ERROR'}, f"Connection failed: {e}. Is the Bridge Process running?")
             _realtime_client = None
@@ -1732,7 +2315,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             props.realtime_status = "Disconnected"
             return {'CANCELLED'}
 
-        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)  # 20 FPS matching ARDY
+        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1759,10 +2342,18 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         props.realtime_status = "Disconnected"
         self.report({'INFO'}, "ARDY stream disconnected.")
 
-    def update_viewport(self, context, joints, frame_num, global_rot_mats=None):
+    def update_viewport(self, context, joints, frame_num, global_rot_mats=None, char_name=None):
         if not joints:
             return
-            
+
+        char = get_active_character(context)
+        if not char:
+            return
+
+        # Ignore stale frame packets belonging to a previous character prior to dynamic switch
+        if char_name and char.name != char_name:
+            return
+
         props = context.scene.ceb_ardy
         scale = props.import_scale
         J = len(joints)
@@ -1774,16 +2365,16 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         if err:
             return
 
-        prefix = "Core" if J == 27 else "SOMA"
-        arm_name = f"{prefix}_Armature"
-        mesh_name = f"{prefix}_Skin"
-        parent_name = f"ARDY_Realtime_Skeleton_{prefix}"
+        char_name_str = char.name
+        clean_prefix = char_name_str.replace(" ", "_")
 
-        # 1. Find existing ARDY character armature & skin mesh
+        arm_name = char.arm_obj_name if (char and char.arm_obj_name) else f"{clean_prefix}_Armature"
+        mesh_name = char.mesh_obj_name if (char and char.mesh_obj_name) else f"{clean_prefix}_Skin"
+        parent_name = char.parent_obj_name if (char and char.parent_obj_name) else f"ARDY_Character_{clean_prefix}"
+
         arm_obj = bpy.data.objects.get(arm_name)
         mesh_obj = bpy.data.objects.get(mesh_name)
 
-        # 2. If armature or skin mesh is missing, construct character via setup_soma_skin
         if not arm_obj or not mesh_obj or len(arm_obj.pose.bones) == 0:
             parent_obj = bpy.data.objects.get(parent_name)
             if not parent_obj:
@@ -1791,20 +2382,22 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 context.scene.collection.objects.link(parent_obj)
                 parent_obj.rotation_euler = (0, 0, 0)
 
-            # Clean up partial object if one exists without the other
             if arm_obj and not mesh_obj:
                 bpy.data.objects.remove(arm_obj, do_unlink=True)
             elif mesh_obj and not arm_obj:
                 bpy.data.objects.remove(mesh_obj, do_unlink=True)
 
-            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths)
+            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name)
+            if char:
+                char.arm_obj_name = arm_obj.name
+                char.mesh_obj_name = f"{clean_prefix}_Skin"
+                char.parent_obj_name = parent_obj.name
         else:
             rig_joint_names = [b.name for b in arm_obj.pose.bones]
 
         if not arm_obj or not rig_joint_names:
             return
 
-        # 3. Load skin transform data (with caching)
         skin_path = get_skin_path(paths, J)
         try:
             if not hasattr(self, "_cached_skin_path") or self._cached_skin_path != skin_path:
@@ -1819,7 +2412,6 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         s30_indices = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 18, 28, 39, 40, 41, 42, 46, 56, 67, 68, 69, 70, 72, 73, 74, 75]
         s77_to_s30 = {s77_idx: s30_idx for s30_idx, s77_idx in enumerate(s30_indices)}
 
-        # Set frame
         context.scene.frame_set(frame_num)
 
         apply_soma_pose(arm_obj, rig_joint_names, bind_rig_transform,
@@ -1831,17 +2423,22 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
 
 classes = (
     CEB_Ardy_PromptItem,
+    CEB_Ardy_Character,
     CEB_Ardy_SceneProperties,
+    CEB_OT_AddCharacterEntry,
+    CEB_OT_RemoveCharacterEntry,
     CEB_OT_AddPromptItem,
     CEB_OT_AddWaypoint,
     CEB_OT_RemoveWaypoint,
     CEB_OT_AddPoseConstraint,
+    CEB_OT_CapturePoseConstraint,
     CEB_OT_RemovePoseConstraint,
     CEB_OT_SelectPromptItem,
     CEB_OT_RemovePromptItem,
     CEB_OT_ClearPromptItems,
     CEB_OT_MovePromptItem,
     CEB_OT_SortPromptItems,
+    CEB_OT_LoadCharacter,
     CEB_OT_ArdyRunServer,
     CEB_OT_ArdyRunDemo,
     CEB_OT_ArdyImportNPZ,

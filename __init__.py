@@ -13,7 +13,12 @@ bl_info = {
 ###        OK - Esta demorando muito para poder agir, tentar ajustar para ser mais rapido
 ### OK - clear animation (blender e blender bridge)
 ### OK - add waypoints
-### OK- add constraints
+### OK - add constraints
+### OK - add option to get the current pose and add as constraint
+### OK - multiple characters
+### - autosave animation as NLA strip at each run
+### - list of nla strip recorded (name is the prompts)
+### - retargt from sam 3d  body result
 
 import bpy
 from bpy.props import StringProperty
