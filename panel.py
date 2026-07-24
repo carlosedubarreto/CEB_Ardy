@@ -120,14 +120,14 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         row.prop(props, "realtime_port", text="Port")
         
         box.prop(props, "quantize_4bit", text="4-bit Quantization (VRAM Save)")
+        box.prop(props, "mute_previous_nla_layers", text="Mute Previous NLA Layers")
 
-        if char:
-            row = box.row(align=True)
-            row.enabled = is_path_set
-            row.operator("ceb.load_character", text=f"Load / Build {char.name}", icon='ARMATURE_DATA')
+        # if char:
+        #     row = box.row(align=True)
+        #     row.enabled = is_path_set
+        #     row.operator("ceb.load_character", text=f"Load / Build {char.name}", icon='ARMATURE_DATA')
         
         row = box.row(align=True)
-        row.prop(props, "realtime_recording", text="Record Animation")
         row.operator("ceb.clean_animation", text="Clean Animation", icon='TRASH')
         
         row = box.row(align=True)
@@ -141,6 +141,17 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         
         if props.realtime_status == "Connected" and char:
             box.prop(char, "realtime_prompt", text=f"Live Prompt ({char.name})")
+
+        # --- Retarget Animation ---
+        # if char:
+        #     box = layout.box()
+        #     box.label(text="Retarget Animation", icon='CON_ARMATURE')
+        #     box.prop_search(props, "source_armature_name", context.scene, "objects", text="Source Armature")
+        #     box.prop(props, "retarget_flip_180", text="180° Facing Correction")
+        #     row = box.row(align=True)
+        #     op = row.operator("ceb.retarget_mhr", text=f"Retarget to {char.name}", icon='ARMATURE_DATA')
+        #     if props.source_armature_name:
+        #         op.source_armature_name = props.source_armature_name
 
         # --- Prompt Schedule ---
         if char:

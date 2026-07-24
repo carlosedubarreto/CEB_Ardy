@@ -388,8 +388,66 @@ def update_has_waypoint(self, context):
         remove_waypoint_empty(self)
     send_waypoints_to_bridge(context)
 
+def sync_prompt_item_object_names(item, context=None):
+    if context is None:
+        context = bpy.context
+    char = get_active_character(context)
+    prefix = get_char_prefix(char)
+
+    # 1. Update Pose Constraint Armature Object Name
+    if getattr(item, "has_pose_constraint", False):
+        arm_name = getattr(item, "pose_armature_name", "")
+        obj = bpy.data.objects.get(arm_name) if arm_name else None
+        
+        # Fallback search if arm_name was lost or not set properly
+        if not obj:
+            for candidate in list(bpy.data.objects):
+                if candidate.type == 'ARMATURE' and ("Ardy_Pose_F" in candidate.name or candidate.name.startswith("ARDY_Pose_F")):
+                    obj = candidate
+                    break
+
+        if obj:
+            target_base_name = f"{prefix}_Ardy_Pose_F{item.start_frame}"
+            if obj.name != target_base_name:
+                new_name = target_base_name
+                idx = 1
+                while bpy.data.objects.get(new_name) and bpy.data.objects.get(new_name) != obj:
+                    new_name = f"{target_base_name}_{idx}"
+                    idx += 1
+                
+                obj.name = new_name
+                if obj.data:
+                    obj.data.name = f"{new_name}_Data"
+                item.pose_armature_name = obj.name
+                print(f"[CEB Ardy] Automatically updated pose constraint armature name to '{obj.name}'")
+
+    # 2. Update Waypoint Empty Object Name
+    if getattr(item, "has_waypoint", False):
+        wp_name = getattr(item, "waypoint_object_name", "")
+        wp_obj = bpy.data.objects.get(wp_name) if wp_name else None
+
+        if not wp_obj:
+            for candidate in list(bpy.data.objects):
+                if candidate.type == 'EMPTY' and ("Ardy_waypoint_F" in candidate.name or candidate.name.startswith("ARDY_Waypoint_F")):
+                    wp_obj = candidate
+                    break
+
+        if wp_obj:
+            target_base_name = f"{prefix}_Ardy_waypoint_F{item.start_frame}"
+            if wp_obj.name != target_base_name:
+                new_name = target_base_name
+                idx = 1
+                while bpy.data.objects.get(new_name) and bpy.data.objects.get(new_name) != wp_obj:
+                    new_name = f"{target_base_name}_{idx}"
+                    idx += 1
+
+                wp_obj.name = new_name
+                item.waypoint_object_name = wp_obj.name
+                print(f"[CEB Ardy] Automatically updated waypoint object name to '{wp_obj.name}'")
+
 def update_prompt_item(self, context):
     global _realtime_client, _active_stream_operator
+    sync_prompt_item_object_names(self, context)
     tag_redraw_view3d(context)
     send_waypoints_to_bridge(context)
     send_pose_constraints_to_bridge(context)
@@ -647,7 +705,27 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     realtime_recording: bpy.props.BoolProperty(
         name="Live Record",
         description="Record the incoming real-time motion stream as keyframes",
+        default=True
+    )
+    mute_previous_nla_layers: bpy.props.BoolProperty(
+        name="Mute Previous NLA Layers",
+        description="Mute existing NLA tracks/layers on the character when starting a new stream",
         default=False
+    )
+    source_armature_name: bpy.props.StringProperty(
+        name="Source Armature",
+        description="Name of the source armature object to retarget from (e.g. GEMX_Armature or MHR_Armature)",
+        default="GEMX_Armature"
+    )
+    mhr_source_armature_name: bpy.props.StringProperty(
+        name="Source MHR Armature",
+        description="Deprecated alias for source_armature_name",
+        default="GEMX_Armature"
+    )
+    retarget_flip_180: bpy.props.BoolProperty(
+        name="180° Facing Correction",
+        description="Flip front-to-back rotation orientation by 180° to align facing direction",
+        default=True
     )
     realtime_status: bpy.props.StringProperty(
         name="Real-time Status",
@@ -850,6 +928,7 @@ class CEB_OT_SortPromptItems(bpy.types.Operator):
             new_item.waypoint_object_name = d["waypoint_object_name"]
             new_item.has_pose_constraint = d["has_pose_constraint"]
             new_item.pose_armature_name = d["pose_armature_name"]
+            sync_prompt_item_object_names(new_item, context)
 
         char.prompt_schedule_index = 0
         tag_redraw_view3d(context)
@@ -1453,18 +1532,26 @@ smpl24_names = [
 
 smpl22_names = smpl24_names[:22]
 
+ARDY_TO_BLENDER_MATRIX = mathutils.Matrix([
+    [1.0,  0.0,  0.0],
+    [0.0,  0.0, -1.0],
+    [0.0,  1.0,  0.0]
+])
+
 def ardy_pos_to_blender(pos_ardy, scale=1.0):
-    """Convert ARDY position (X-Right, Y-Up, Z-Forward) to Blender position (X-Right, Y-Forward, Z-Up)."""
-    return mathutils.Vector((float(pos_ardy[0]) * scale, float(pos_ardy[2]) * scale, float(pos_ardy[1]) * scale))
+    """Convert ARDY position to Blender position (baked 180° Z rotation to align with Blender conventions and MHR)."""
+    return mathutils.Vector((float(pos_ardy[0]) * scale, -float(pos_ardy[2]) * scale, float(pos_ardy[1]) * scale))
 
 def ardy_rot_to_blender(R_a):
-    """Convert ARDY 3x3 rotation matrix to Blender 3x3 rotation matrix by swapping Y and Z axes."""
-    m = mathutils.Matrix.Identity(3)
+    """Convert ARDY 3x3 rotation matrix to Blender 3x3 rotation matrix using coordinate transformation matrix."""
     if R_a is not None:
-        m[0][0] = float(R_a[0][0]); m[0][1] = float(R_a[0][2]); m[0][2] = float(R_a[0][1])
-        m[1][0] = float(R_a[2][0]); m[1][1] = float(R_a[2][2]); m[1][2] = float(R_a[2][1])
-        m[2][0] = float(R_a[1][0]); m[2][1] = float(R_a[1][2]); m[2][2] = float(R_a[1][1])
-    return m
+        R_mat = mathutils.Matrix([
+            [float(R_a[0][0]), float(R_a[0][1]), float(R_a[0][2])],
+            [float(R_a[1][0]), float(R_a[1][1]), float(R_a[1][2])],
+            [float(R_a[2][0]), float(R_a[2][1]), float(R_a[2][2])],
+        ])
+        return ARDY_TO_BLENDER_MATRIX @ R_mat @ ARDY_TO_BLENDER_MATRIX.transposed()
+    return mathutils.Matrix.Identity(3)
 
 def ardy_transform_to_blender_matrix(pos_ardy, R_a, scale=1.0):
     """Construct a 4x4 Blender matrix from ARDY position and 3x3 rotation."""
@@ -1475,27 +1562,46 @@ def ardy_transform_to_blender_matrix(pos_ardy, R_a, scale=1.0):
     return mat
 
 def get_skin_path(paths, J):
-    if J == 27:
-        rel = os.path.join("ardy", "assets", "skeletons", "cskel27", "skin_standard.npz")
-    else:
-        rel = os.path.join("ardy", "assets", "skeletons", "somaskel77", "skin_standard.npz")
-    return os.path.join(paths["ardy_dir"], rel)
+    addon_dir = os.path.dirname(os.path.abspath(__file__))
+    skin_filename = "skin_core.npz" if J == 27 else "skin_standard.npz"
+    skel_dir = "cskel27" if J == 27 else "somaskel77"
 
-def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None):
+    candidate_paths = [
+        os.path.join(addon_dir, "data", skin_filename),
+        os.path.join(addon_dir, "data", skel_dir, "skin_standard.npz"),
+        r"D:\_Code\Meu\CEB_Ardy_prj\Portable_Ardy\ardy\ardy\assets\skeletons\cskel27\skin_standard.npz" if J == 27 else r"D:\_Code\Meu\CEB_Ardy_prj\Portable_Ardy\ardy\ardy\assets\skeletons\somaskel77\skin_standard.npz",
+        r"D:\_Code\Meu\CEB_Ardy_prj\Portable_Ardy\python-3.11.9-embed-amd64\Lib\site-packages\ardy\assets\skeletons\cskel27\skin_standard.npz" if J == 27 else r"D:\_Code\Meu\CEB_Ardy_prj\Portable_Ardy\python-3.11.9-embed-amd64\Lib\site-packages\ardy\assets\skeletons\somaskel77\skin_standard.npz",
+    ]
+    if paths and isinstance(paths, dict) and "ardy_dir" in paths and paths["ardy_dir"]:
+        rel = os.path.join("ardy", "assets", "skeletons", skel_dir, "skin_standard.npz")
+        candidate_paths.append(os.path.join(paths["ardy_dir"], rel))
+
+    for path in candidate_paths:
+        if os.path.exists(path):
+            return path
+            
+    if paths and isinstance(paths, dict) and "ardy_dir" in paths and paths["ardy_dir"]:
+        return os.path.join(paths["ardy_dir"], "ardy", "assets", "skeletons", skel_dir, "skin_standard.npz")
+    return candidate_paths[0]
+
+def setup_soma_skin(context, parent_obj=None, J=27, scale=1.0, paths=None, char_name=None, skin_path=None):
     try:
         import numpy as np
     except ImportError:
+        print("[CEB Ardy] NumPy is required to setup Ardy skin.")
         return None, None
         
-    skin_path = get_skin_path(paths, J)
-    if not os.path.exists(skin_path):
+    if not skin_path:
+        skin_path = get_skin_path(paths, J)
+        
+    if not skin_path or not os.path.exists(skin_path):
         print(f"[CEB Ardy] Skin path not found: {skin_path}")
         return None, None
         
     try:
         skin_data = np.load(skin_path)
     except Exception as e:
-        print(f"[CEB Ardy] Failed to load skin npz: {e}")
+        print(f"[CEB Ardy] Failed to load skin npz ({skin_path}): {e}")
         return None, None
         
     bind_vertices = skin_data["bind_vertices"]
@@ -1506,11 +1612,20 @@ def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None):
     lbs_weights = skin_data["lbs_weights"]
     rig_joint_connections = skin_data["rig_joint_connections"]
     
-    parent_obj.rotation_euler = (0, 0, 0)
+    if parent_obj:
+        parent_obj.rotation_euler = (0, 0, 0)
 
     clean_prefix = char_name.replace(" ", "_") if char_name else ("Core" if J == 27 else "SOMA")
 
-    # 1. Create Mesh
+    # 1. Create Armature
+    arm_data = bpy.data.armatures.new(f"{clean_prefix}_Armature_Data")
+    arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
+    context.scene.collection.objects.link(arm_obj)
+    arm_obj.rotation_euler = (0, 0, 0)
+    if parent_obj:
+        arm_obj.parent = parent_obj
+
+    # 2. Create Mesh & Parent directly to Armature
     mesh_data = bpy.data.meshes.new(name=f"{clean_prefix}_Skin_Mesh")
     mesh_obj = bpy.data.objects.new(f"{clean_prefix}_Skin", mesh_data)
     context.scene.collection.objects.link(mesh_obj)
@@ -1520,13 +1635,7 @@ def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None):
     mesh_data.from_pydata(verts, [], faces_list)
     mesh_data.update()
     
-    mesh_obj.parent = parent_obj
-    
-    # 2. Create Armature
-    arm_data = bpy.data.armatures.new(f"{clean_prefix}_Armature_Data")
-    arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
-    context.scene.collection.objects.link(arm_obj)
-    arm_obj.parent = parent_obj
+    mesh_obj.parent = arm_obj
     
     # Add Armature Modifier
     arm_mod = mesh_obj.modifiers.new(name=f"{clean_prefix}_Armature_Mod", type='ARMATURE')
@@ -1580,7 +1689,8 @@ def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None):
             bone.parent = parent_bone
             
     bpy.ops.object.mode_set(mode='OBJECT')
-    context.view_layer.objects.active = original_active
+    if original_active and original_active.name in context.view_layer.objects:
+        context.view_layer.objects.active = original_active
     
     # 4. Skin the Mesh (vertex weights for all W weight slots)
     for name in rig_joint_names:
@@ -1774,10 +1884,6 @@ def import_ardy_npz(filepath, context, op=None):
     # Retrieve global rotations if available
     global_rot_mats = data['global_rot_mats'] if 'global_rot_mats' in data else None
 
-    parent_obj = bpy.data.objects.new(f"ARDY_{motion_name}", None)
-    context.scene.collection.objects.link(parent_obj)
-    parent_obj.rotation_euler = (0, 0, 0)
-    
     props = context.scene.ceb_ardy
     scale = props.import_scale
     
@@ -1787,7 +1893,7 @@ def import_ardy_npz(filepath, context, op=None):
             op.report({'ERROR'}, err)
         return {'CANCELLED'}
         
-    arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths)
+    arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=motion_name)
     if not arm_obj:
         msg = "Failed to build skinned mesh and armature."
         if op:
@@ -2059,6 +2165,8 @@ class CEB_OT_CleanAnimation(bpy.types.Operator):
             _active_stream_operator._frame_queue = []
             _active_stream_operator._buffer = ""
             _active_stream_operator._start_frame = 1
+            _active_stream_operator._prepared_arm_name = None
+            _active_stream_operator._reset_pending = True
 
         # Send RESET signal to real-time bridge server if connected or reachable
         global _realtime_client, _realtime_running
@@ -2124,18 +2232,12 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
         mesh_name = f"{clean_prefix}_Skin"
         parent_name = f"ARDY_Character_{clean_prefix}"
 
-        for obj_name in (arm_name, mesh_name):
+        for obj_name in (arm_name, mesh_name, parent_name):
             obj = bpy.data.objects.get(obj_name)
             if obj:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
-        parent_obj = bpy.data.objects.get(parent_name)
-        if not parent_obj:
-            parent_obj = bpy.data.objects.new(parent_name, None)
-            context.scene.collection.objects.link(parent_obj)
-            parent_obj.rotation_euler = (0, 0, 0)
-
-        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name)
+        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=char_name)
         if not arm_obj:
             self.report({'ERROR'}, f"Failed to build mesh and armature for {char.name}.")
             return {'CANCELLED'}
@@ -2145,9 +2247,50 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
 
         char.arm_obj_name = arm_obj.name
         char.mesh_obj_name = f"{clean_prefix}_Skin"
-        char.parent_obj_name = parent_obj.name
+        char.parent_obj_name = ""
 
         self.report({'INFO'}, f"Character loaded: {arm_obj.name} ({J} joints, scale={scale})")
+        return {'FINISHED'}
+
+
+class CEB_OT_LoadArdyCore(bpy.types.Operator):
+    """Load Ardy Core body armature and skinned mesh (27 joints)"""
+    bl_idname = "ceb.load_ardy_core"
+    bl_label = "Load Ardy Core"
+    bl_description = "Load Ardy Core body armature and skinned mesh (27 joints)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        paths, _ = get_ardy_paths(context)
+        skin_path = get_skin_path(paths, J=27)
+
+        if not skin_path or not os.path.exists(skin_path):
+            self.report({'ERROR'}, "Could not locate Ardy Core skin NPZ file.")
+            return {'CANCELLED'}
+
+        clean_prefix = "Ardy_Core"
+        arm_name = f"{clean_prefix}_Armature"
+        mesh_name = f"{clean_prefix}_Skin"
+        parent_name = f"ARDY_Character_{clean_prefix}"
+
+        for obj_name in (arm_name, mesh_name, parent_name):
+            obj = bpy.data.objects.get(obj_name)
+            if obj:
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        arm_obj, rig_joint_names = setup_soma_skin(
+            context, parent_obj=None, J=27, scale=1.0, paths=paths, char_name=clean_prefix, skin_path=skin_path
+        )
+
+        if not arm_obj:
+            self.report({'ERROR'}, "Failed to build Ardy Core mesh and armature.")
+            return {'CANCELLED'}
+
+        bpy.ops.object.select_all(action='DESELECT')
+        arm_obj.select_set(True)
+        context.view_layer.objects.active = arm_obj
+
+        self.report({'INFO'}, f"Ardy Core Body Armature Loaded Successfully: {arm_obj.name}")
         return {'FINISHED'}
 
 
@@ -2162,16 +2305,17 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
 
-        bridge_script = os.path.join(paths["ardy_dir"], "scripts", "blender_bridge.py")
+        addon_dir = os.path.dirname(os.path.abspath(__file__))
+        bridge_script = os.path.join(addon_dir, "blender_bridge.py")
         if not os.path.exists(bridge_script):
-            self.report({'ERROR'}, f"Could not find bridge script: {bridge_script}")
+            self.report({'ERROR'}, f"Could not find bridge script in addon folder: {bridge_script}")
             return {'CANCELLED'}
 
         props = context.scene.ceb_ardy
         char = get_active_character(context)
         model = char.model if char else 'core'
 
-        cmd = [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", model]
+        cmd = [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", model, "--ardy-dir", paths["ardy_dir"]]
         if props.quantize_4bit:
             cmd.append("--quantize-4bit")
 
@@ -2188,6 +2332,348 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
 
         return {'FINISHED'}
 
+def get_stream_action_name(char):
+    """
+    Generate action name based on character name, set prompts and count of waypoints and pose constraints.
+    Example: 'Character_1_walk_W1_C0' or 'Hero_walk, run_W2_C1'
+    """
+    char_name = char.name if char and char.name else "Character_1"
+
+    if not char:
+        return f"{char_name}_ARDY_Stream_W0_C0"
+
+    prompts = [
+        item.prompt.strip()
+        for item in char.prompt_schedule
+        if item.enabled
+        and not getattr(item, "has_waypoint", False)
+        and not getattr(item, "has_pose_constraint", False)
+        and item.prompt
+        and item.prompt.strip()
+    ]
+    if prompts:
+        prompt_text = ", ".join(prompts)
+    elif char.realtime_prompt and char.realtime_prompt.strip():
+        prompt_text = char.realtime_prompt.strip()
+    else:
+        prompt_text = "walk"
+
+    num_waypoints = sum(1 for item in char.prompt_schedule if item.enabled and getattr(item, "has_waypoint", False))
+    num_constraints = sum(1 for item in char.prompt_schedule if item.enabled and getattr(item, "has_pose_constraint", False))
+
+    return f"{char_name}_{prompt_text}_W{num_waypoints}_C{num_constraints}"
+
+
+def push_action_to_nla_track(arm_obj, action):
+    """
+    Pushes an action onto a new NLA track for the armature object,
+    setting the action and strip as fake user to avoid Blender erasing it.
+    """
+    if not arm_obj or not action:
+        return None
+
+    if not arm_obj.animation_data:
+        arm_obj.animation_data_create()
+
+    action.use_fake_user = True
+
+    start_frame = int(action.frame_range[0]) if len(action.fcurves) > 0 else 1
+
+    track = arm_obj.animation_data.nla_tracks.new()
+    track.name = action.name
+    try:
+        strip = track.strips.new(name=action.name, start=start_frame, action=action)
+        strip.extrapolation = 'HOLD_FORWARD'
+        track.mute = False
+        print(f"[CEB Ardy] Created NLA track and strip '{action.name}' (fake_user=True, extrapolation=NOTHING)")
+        return track
+    except Exception as e:
+        print(f"[CEB Ardy] Error creating NLA strip for action '{action.name}': {e}")
+        return None
+
+
+def prepare_armature_for_streaming(arm_obj, char, context=None):
+    """
+    Prepares character armature object for a new streaming session:
+    1. Mutes all other NLA layers (tracks) on the character if option is enabled.
+    2. Removes / pushes down any active action strip from the current layer.
+    3. Creates a new Action named with prompts, waypoints, and constraints count, and sets fake user.
+    """
+    if not arm_obj:
+        return None
+
+    if not arm_obj.animation_data:
+        arm_obj.animation_data_create()
+
+    anim_data = arm_obj.animation_data
+
+    if context is None:
+        context = bpy.context
+    props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
+    should_mute = props.mute_previous_nla_layers if props and hasattr(props, "mute_previous_nla_layers") else True
+
+    # 1. Mute all existing NLA layers (tracks) on the character armature if option is enabled
+    if should_mute:
+        for track in anim_data.nla_tracks:
+            track.mute = True
+
+    # 2. Remove active action strip from main action slot if any (push down first if it has keyframes)
+    if anim_data.action:
+        old_act = anim_data.action
+        if len(old_act.fcurves) > 0:
+            push_action_to_nla_track(arm_obj, old_act)
+        anim_data.action = None
+
+    # 3. Create a new NLA action for this stream session
+    act_name = get_stream_action_name(char)
+    new_act = bpy.data.actions.new(name=act_name)
+    new_act.use_fake_user = True
+    anim_data.action = new_act
+    print(f"[CEB Ardy] Prepared new NLA action '{new_act.name}' (fake_user=True, mute_previous={should_mute}) for character '{char.name if char else 'Armature'}'")
+    return new_act
+
+
+MHR_TO_ARDY_BONE_MAP = {
+    "root": "Hips",
+    "c_spine0": "Spine",
+    "c_spine1": "Spine1",
+    "c_spine2": "Spine2",
+    "c_spine3": "Spine3",
+    "c_neck": "Neck",
+    "c_head": "Head",
+    "r_clavicle": "RightShoulder",
+    "r_uparm": "RightArm",
+    "r_lowarm": "RightForeArm",
+    "r_wrist": "RightHand",
+    "l_clavicle": "LeftShoulder",
+    "l_uparm": "LeftArm",
+    "l_lowarm": "LeftForeArm",
+    "l_wrist": "LeftHand",
+    "r_upleg": "RightUpLeg",
+    "r_lowleg": "RightLeg",
+    "r_foot": "RightFoot",
+    "r_ball": "RightToeBase",
+    "l_upleg": "LeftUpLeg",
+    "l_lowleg": "LeftLeg",
+    "l_foot": "LeftFoot",
+    "l_ball": "LeftToeBase",
+}
+
+GEMX_TO_ARDY_BONE_MAP = {
+    "Hips": "Hips",
+    "Spine1": "Spine",
+    "Spine2": "Spine1",
+    "Chest": "Spine3",
+    "Neck1": "Neck",
+    "Neck2": "Neck",
+    "Head": "Head",
+    "RightShoulder": "RightShoulder",
+    "RightArm": "RightArm",
+    "RightForeArm": "RightForeArm",
+    "RightHand": "RightHand",
+    "RightHandThumb1": "RightHandThumb1",
+    "LeftShoulder": "LeftShoulder",
+    "LeftArm": "LeftArm",
+    "LeftForeArm": "LeftForeArm",
+    "LeftHand": "LeftHand",
+    "LeftHandThumb1": "LeftHandThumb1",
+    "RightLeg": "RightUpLeg",
+    "RightShin": "RightLeg",
+    "RightFoot": "RightFoot",
+    "RightToeBase": "RightToeBase",
+    "LeftLeg": "LeftUpLeg",
+    "LeftShin": "LeftLeg",
+    "LeftFoot": "LeftFoot",
+    "LeftToeBase": "LeftToeBase",
+}
+
+
+def get_bone_map_for_armature(src_arm_obj, tgt_arm_obj):
+    """Dynamically determines the bone mapping dictionary based on source armature structure."""
+    src_bone_names = set(b.name for b in src_arm_obj.data.bones)
+    if "LeftShin" in src_bone_names or "Chest" in src_bone_names or "Root" in src_bone_names:
+        print(f"[CEB Ardy] Detected GEMX Armature structure in '{src_arm_obj.name}'.")
+        return GEMX_TO_ARDY_BONE_MAP
+    elif "l_lowleg" in src_bone_names or "body_world" in src_bone_names:
+        print(f"[CEB Ardy] Detected MHR Armature structure in '{src_arm_obj.name}'.")
+        return MHR_TO_ARDY_BONE_MAP
+    else:
+        print(f"[CEB Ardy] Unknown armature structure in '{src_arm_obj.name}'; using direct name match.")
+        tgt_bone_names = set(b.name for b in tgt_arm_obj.data.bones)
+        return {b: b for b in src_bone_names if b in tgt_bone_names}
+
+
+def retarget_animation_to_ardy(tgt_arm_obj, src_arm_obj, context=None):
+    """
+    Retargets animation keyframes from a source armature object (GEMX, MHR, etc.) to the active ARDY Core character armature,
+    creating a new Action set as fake user and pushed down to an NLA track.
+    """
+    if context is None:
+        context = bpy.context
+
+    if not src_arm_obj or src_arm_obj.type != 'ARMATURE':
+        print("[CEB Ardy] Retarget failed: Source armature object is invalid or not an armature.")
+        return None
+
+    if not tgt_arm_obj or tgt_arm_obj.type != 'ARMATURE':
+        print("[CEB Ardy] Retarget failed: Target ARDY armature object is invalid or not an armature.")
+        return None
+
+    bone_map = get_bone_map_for_armature(src_arm_obj, tgt_arm_obj)
+    if not bone_map:
+        print("[CEB Ardy] Retarget failed: No compatible bone mapping found.")
+        return None
+
+    # Determine frame range from source action or scene
+    if src_arm_obj.animation_data and src_arm_obj.animation_data.action:
+        src_act = src_arm_obj.animation_data.action
+        frame_start = int(src_act.frame_range[0])
+        frame_end = int(src_act.frame_range[1])
+    else:
+        frame_start = context.scene.frame_start
+        frame_end = context.scene.frame_end
+
+    char = get_active_character(context)
+    char_name = char.name if char else tgt_arm_obj.name.replace("_Armature", "")
+    act_name = f"{char_name}_Retarget"
+
+    # Create new action for target armature
+    target_act = bpy.data.actions.new(name=act_name)
+    target_act.use_fake_user = True
+
+    if not tgt_arm_obj.animation_data:
+        tgt_arm_obj.animation_data_create()
+    tgt_arm_obj.animation_data.action = target_act
+
+    props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
+    flip_180 = props.retarget_flip_180 if props and hasattr(props, "retarget_flip_180") else False
+    R_corr_z = mathutils.Matrix.Rotation(math.pi, 3, 'Z')
+
+    # Build topological bone processing order (parents always before children)
+    remaining = list(bone_map.keys())
+    src_ordered = []
+    while remaining:
+        progress = False
+        for src_bname in list(remaining):
+            src_pbone = src_arm_obj.pose.bones.get(src_bname)
+            parent_in_remaining = (src_pbone.parent and src_pbone.parent.name in remaining) if src_pbone else False
+            if not parent_in_remaining:
+                src_ordered.append(src_bname)
+                remaining.remove(src_bname)
+                progress = True
+        if not progress:
+            src_ordered.extend(remaining)
+            break
+
+    # Perform frame-by-frame pose retargeting using world-space matrix copy
+    for frame in range(frame_start, frame_end + 1):
+        context.scene.frame_set(frame)
+        context.view_layer.update()
+
+        for src_bone_name in src_ordered:
+            tgt_bone_name = bone_map[src_bone_name]
+            src_pbone = src_arm_obj.pose.bones.get(src_bone_name)
+            tgt_pbone = tgt_arm_obj.pose.bones.get(tgt_bone_name)
+            if not src_pbone or not tgt_pbone:
+                continue
+
+            tgt_pbone.rotation_mode = 'QUATERNION'
+            is_root = (tgt_bone_name == "Hips" or tgt_pbone.parent is None)
+
+            if is_root:
+                if flip_180:
+                    src_loc = R_corr_z @ src_pbone.location
+                    src_rot_arm = (R_corr_z @ src_pbone.matrix.to_3x3()).to_4x4()
+                else:
+                    src_loc = src_pbone.location.copy()
+                    src_rot_arm = src_pbone.matrix.to_3x3().to_4x4()
+                tgt_pbone.matrix = mathutils.Matrix.Translation(src_loc) @ src_rot_arm
+                tgt_pbone.keyframe_insert(data_path="location", frame=frame)
+            else:
+                tgt_pbone.location = mathutils.Vector((0.0, 0.0, 0.0))
+                if flip_180:
+                    tgt_pbone.matrix = R_corr_z.to_4x4() @ src_pbone.matrix
+                else:
+                    tgt_pbone.matrix = src_pbone.matrix
+
+            tgt_pbone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+            context.view_layer.update()
+
+    # Push to NLA Track
+    push_action_to_nla_track(tgt_arm_obj, target_act)
+    tgt_arm_obj.animation_data.action = None
+
+    context.scene.frame_start = frame_start
+    context.scene.frame_end = frame_end
+    context.scene.frame_set(frame_start)
+    tag_redraw_view3d(context)
+
+    print(f"[CEB Ardy] Successfully retargeted animation '{src_arm_obj.name}' to '{tgt_arm_obj.name}' ({frame_start}..{frame_end}) as NLA track '{target_act.name}'")
+    return target_act
+
+
+def retarget_mhr_to_ardy(tgt_arm_obj, src_arm_obj, context=None):
+    """Backward-compatible wrapper function for retarget_animation_to_ardy."""
+    return retarget_animation_to_ardy(tgt_arm_obj, src_arm_obj, context=context)
+
+
+class CEB_OT_RetargetMHR(bpy.types.Operator):
+    bl_idname = "ceb.retarget_mhr"
+    bl_label = "Retarget to ARDY Core"
+    bl_description = "Retarget animation from source armature object (GEMX_Armature, MHR, etc.) to active ARDY Core character armature"
+
+    source_armature_name: bpy.props.StringProperty(
+        name="Source Armature",
+        description="Name of the source armature object",
+        default="GEMX_Armature"
+    )
+
+    def execute(self, context):
+        char = get_active_character(context)
+        if not char:
+            self.report({'ERROR'}, "No active ARDY character found in character list.")
+            return {'CANCELLED'}
+
+        clean_prefix = char.name.replace(" ", "_")
+        target_arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+        tgt_arm_obj = bpy.data.objects.get(target_arm_name)
+
+        if not tgt_arm_obj:
+            active = context.active_object
+            if active and active.type == 'ARMATURE':
+                tgt_arm_obj = active
+
+        if not tgt_arm_obj:
+            self.report({'ERROR'}, f"Target ARDY character armature '{target_arm_name}' not found. Please Load/Build the character first.")
+            return {'CANCELLED'}
+
+        props = getattr(context.scene, "ceb_ardy", None)
+        src_name = self.source_armature_name
+        if props and hasattr(props, "source_armature_name") and props.source_armature_name:
+            src_name = props.source_armature_name
+
+        src_arm_obj = bpy.data.objects.get(src_name)
+        if not src_arm_obj:
+            # Fallback search for GEMX or MHR armatures in scene
+            for obj in context.scene.objects:
+                if obj.type == 'ARMATURE' and obj != tgt_arm_obj:
+                    if "GEMX" in obj.name.upper() or "MHR" in obj.name.upper():
+                        src_arm_obj = obj
+                        break
+
+        if not src_arm_obj:
+            self.report({'ERROR'}, f"Source armature '{src_name}' not found in scene.")
+            return {'CANCELLED'}
+
+        act = retarget_animation_to_ardy(tgt_arm_obj, src_arm_obj, context=context)
+        if not act:
+            self.report({'ERROR'}, "Failed to retarget animation.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Successfully retargeted '{src_arm_obj.name}' to '{char.name}' as NLA action '{act.name}'.")
+        return {'FINISHED'}
+
+
 class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
     bl_idname = "ceb.ardy_realtime_stream"
     bl_label = "Toggle Real-time Stream"
@@ -2196,6 +2682,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
     _timer = None
     _buffer = ""
     _frame_queue = None
+    _prepared_arm_name = None
 
     def modal(self, context, event):
         global _realtime_client, _realtime_running
@@ -2290,6 +2777,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             
             self._buffer = ""
             self._frame_queue = []
+            self._reset_pending = True
             
             current_frame = context.scene.frame_current
             self._start_frame = current_frame
@@ -2297,6 +2785,17 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             active_prompt = get_active_prompt_for_frame(props, current_frame, context=context)
             if char:
                 char.realtime_prompt = active_prompt
+                clean_prefix = char.name.replace(" ", "_")
+                arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+                arm_obj = bpy.data.objects.get(arm_name)
+                if arm_obj:
+                    prepare_armature_for_streaming(arm_obj, char, context=context)
+                    self._prepared_arm_name = arm_obj.name
+                else:
+                    self._prepared_arm_name = None
+            else:
+                self._prepared_arm_name = None
+
             self._last_sent_prompt = active_prompt
 
             model = char.model if char else 'core'
@@ -2312,6 +2811,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             _active_stream_operator = None
             self._buffer = ""
             self._frame_queue = None
+            self._prepared_arm_name = None
             props.realtime_status = "Disconnected"
             return {'CANCELLED'}
 
@@ -2335,8 +2835,20 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 pass
             _realtime_client = None
             
+        char = get_active_character(context)
+        if char:
+            clean_prefix = char.name.replace(" ", "_")
+            arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+            arm_obj = bpy.data.objects.get(arm_name)
+            if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action:
+                act = arm_obj.animation_data.action
+                if len(act.fcurves) > 0:
+                    push_action_to_nla_track(arm_obj, act)
+                arm_obj.animation_data.action = None
+
         self._buffer = ""
         self._frame_queue = None
+        self._prepared_arm_name = None
         _realtime_running = False
         _active_stream_operator = None
         props.realtime_status = "Disconnected"
@@ -2376,27 +2888,34 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         mesh_obj = bpy.data.objects.get(mesh_name)
 
         if not arm_obj or not mesh_obj or len(arm_obj.pose.bones) == 0:
-            parent_obj = bpy.data.objects.get(parent_name)
-            if not parent_obj:
-                parent_obj = bpy.data.objects.new(parent_name, None)
-                context.scene.collection.objects.link(parent_obj)
-                parent_obj.rotation_euler = (0, 0, 0)
+            for o_name in (arm_name, mesh_name, parent_name):
+                if o_name:
+                    o_obj = bpy.data.objects.get(o_name)
+                    if o_obj:
+                        bpy.data.objects.remove(o_obj, do_unlink=True)
 
-            if arm_obj and not mesh_obj:
-                bpy.data.objects.remove(arm_obj, do_unlink=True)
-            elif mesh_obj and not arm_obj:
-                bpy.data.objects.remove(mesh_obj, do_unlink=True)
-
-            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name)
+            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=char_name_str)
             if char:
                 char.arm_obj_name = arm_obj.name
                 char.mesh_obj_name = f"{clean_prefix}_Skin"
-                char.parent_obj_name = parent_obj.name
+                char.parent_obj_name = ""
         else:
             rig_joint_names = [b.name for b in arm_obj.pose.bones]
 
         if not arm_obj or not rig_joint_names:
             return
+
+        if getattr(self, "_prepared_arm_name", None) != arm_obj.name:
+            prepare_armature_for_streaming(arm_obj, char, context=context)
+            self._prepared_arm_name = arm_obj.name
+
+        start_f = getattr(self, "_start_frame", 1)
+        if getattr(self, "_reset_pending", False):
+            if abs(frame_num - start_f) > 2 and frame_num > start_f:
+                print(f"[CEB Ardy Stream] Discarding stale pre-reset frame packet {frame_num} (expected start near frame {start_f})")
+                return
+            else:
+                self._reset_pending = False
 
         skin_path = get_skin_path(paths, J)
         try:
@@ -2439,12 +2958,14 @@ classes = (
     CEB_OT_MovePromptItem,
     CEB_OT_SortPromptItems,
     CEB_OT_LoadCharacter,
+    CEB_OT_LoadArdyCore,
     CEB_OT_ArdyRunServer,
     CEB_OT_ArdyRunDemo,
     CEB_OT_ArdyImportNPZ,
     CEB_OT_CleanAnimation,
     CEB_OT_ArdyStartBridge,
     CEB_OT_ArdyRealtimeStream,
+    CEB_OT_RetargetMHR,
 )
 
 def register():

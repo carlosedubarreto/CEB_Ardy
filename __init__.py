@@ -16,9 +16,9 @@ bl_info = {
 ### OK - add constraints
 ### OK - add option to get the current pose and add as constraint
 ### OK - multiple characters
-### - autosave animation as NLA strip at each run
-### - list of nla strip recorded (name is the prompts)
-### - retargt from sam 3d  body result
+### OK - autosave animation as NLA strip at each run
+### - retarget from sam 3d  body result (nao para agora, tive muitos problemas)
+### - list of nla strip recorded (name is the prompts) (TALVEZ) , pois ja tenho essa função no SAM
 
 import bpy
 from bpy.props import StringProperty
