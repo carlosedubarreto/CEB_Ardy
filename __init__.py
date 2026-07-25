@@ -20,6 +20,10 @@ bl_info = {
 ### - retarget from sam 3d  body result (nao para agora, tive muitos problemas)
 ### - list of nla strip recorded (name is the prompts) (TALVEZ) , pois ja tenho essa função no SAM
 
+### OK - portable python enable quantization webapp
+### - keyboard based velocity
+### - Kinematic constraints 
+
 import bpy
 from bpy.props import StringProperty
 

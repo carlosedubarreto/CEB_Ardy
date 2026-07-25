@@ -134,6 +134,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         row.scale_y = 1.1
         row.enabled = is_path_set or (props.realtime_status == "Connected")
         row.operator("ceb.ardy_start_bridge", text="Start Bridge", icon='PLAY')
+        row.operator("ceb.ardy_run_demo", text="Start Viser Web App", icon='URL')
         
         stream_text = "Disconnect Stream" if props.realtime_status == "Connected" else "Connect Stream"
         stream_icon = 'CANCEL' if props.realtime_status == "Connected" else 'LINK_BLEND'

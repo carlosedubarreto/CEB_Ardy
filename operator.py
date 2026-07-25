@@ -1977,13 +1977,18 @@ class CEB_OT_ArdyRunDemo(bpy.types.Operator):
             self.report({'ERROR'}, f"Could not find demo script: {paths['run_demo_script']}")
             return {'CANCELLED'}
 
+        props = context.scene.ceb_ardy
+        cmd = [paths["python_exe"], paths["run_demo_script"]]
+        if props.quantize_4bit:
+            cmd.append("--quantize-4bit")
+
         try:
             subprocess.Popen(
-                [paths["python_exe"], paths["run_demo_script"]],
+                cmd,
                 cwd=paths["ardy_dir"],
                 creationflags=0x00000010  # CREATE_NEW_CONSOLE
             )
-            self.report({'INFO'}, "Launching Interactive Demo...")
+            self.report({'INFO'}, f"Launching Viser Web App Demo (4-bit quantization: {props.quantize_4bit})...")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to start demo: {e}")
             return {'CANCELLED'}
