@@ -70,14 +70,17 @@ def send_waypoints_to_bridge(context=None, start_frame=None):
         print(f"[CEB Ardy] Error sending waypoints over socket: {e}")
 
 def blender_pos_to_ardy(pos_b, scale=1.0):
-    return [float(pos_b[0]) / scale, float(pos_b[2]) / scale, float(pos_b[1]) / scale]
+    """Convert Blender position (X-Right, Y-Forward, Z-Up) to ARDY position (X-Left, Y-Up, Z-Forward)."""
+    return [-float(pos_b[0]) / scale, float(pos_b[2]) / scale, float(pos_b[1]) / scale]
 
 def blender_rot_to_ardy(R_b):
+    """Convert Blender 3x3 rotation matrix to ARDY 3x3 rotation matrix using M = [[-1,0,0],[0,0,1],[0,1,0]]."""
     return [
-        [float(R_b[0][0]), float(R_b[0][2]), float(R_b[0][1])],
-        [float(R_b[2][0]), float(R_b[2][2]), float(R_b[2][1])],
-        [float(R_b[1][0]), float(R_b[1][2]), float(R_b[1][1])],
+        [ float(R_b[0][0]), -float(R_b[0][2]), -float(R_b[0][1])],
+        [-float(R_b[2][0]),  float(R_b[2][2]),  float(R_b[2][1])],
+        [-float(R_b[1][0]),  float(R_b[1][2]),  float(R_b[1][1])],
     ]
+
 
 # ARDY joint name orderings (must appear before send_pose_constraints_to_bridge)
 _soma30_names = [
@@ -1533,25 +1536,23 @@ smpl24_names = [
 smpl22_names = smpl24_names[:22]
 
 ARDY_TO_BLENDER_MATRIX = mathutils.Matrix([
-    [1.0,  0.0,  0.0],
-    [0.0,  0.0, -1.0],
-    [0.0,  1.0,  0.0]
+    [-1.0,  0.0,  0.0],
+    [ 0.0,  0.0,  1.0],
+    [ 0.0,  1.0,  0.0]
 ])
 
 def ardy_pos_to_blender(pos_ardy, scale=1.0):
-    """Convert ARDY position to Blender position (baked 180° Z rotation to align with Blender conventions and MHR)."""
-    return mathutils.Vector((float(pos_ardy[0]) * scale, -float(pos_ardy[2]) * scale, float(pos_ardy[1]) * scale))
+    """Convert ARDY position (X-Left, Y-Up, Z-Forward) to Blender position (X-Right, Y-Forward, Z-Up)."""
+    return mathutils.Vector((-float(pos_ardy[0]) * scale, float(pos_ardy[2]) * scale, float(pos_ardy[1]) * scale))
 
 def ardy_rot_to_blender(R_a):
-    """Convert ARDY 3x3 rotation matrix to Blender 3x3 rotation matrix using coordinate transformation matrix."""
+    """Convert ARDY 3x3 rotation matrix to Blender 3x3 rotation matrix using M = [[-1,0,0],[0,0,1],[0,1,0]]."""
+    m = mathutils.Matrix.Identity(3)
     if R_a is not None:
-        R_mat = mathutils.Matrix([
-            [float(R_a[0][0]), float(R_a[0][1]), float(R_a[0][2])],
-            [float(R_a[1][0]), float(R_a[1][1]), float(R_a[1][2])],
-            [float(R_a[2][0]), float(R_a[2][1]), float(R_a[2][2])],
-        ])
-        return ARDY_TO_BLENDER_MATRIX @ R_mat @ ARDY_TO_BLENDER_MATRIX.transposed()
-    return mathutils.Matrix.Identity(3)
+        m[0][0] =  float(R_a[0][0]); m[0][1] = -float(R_a[0][2]); m[0][2] = -float(R_a[0][1])
+        m[1][0] = -float(R_a[2][0]); m[1][1] =  float(R_a[2][2]); m[1][2] =  float(R_a[2][1])
+        m[2][0] = -float(R_a[1][0]); m[2][1] =  float(R_a[1][2]); m[2][2] =  float(R_a[1][1])
+    return m
 
 def ardy_transform_to_blender_matrix(pos_ardy, R_a, scale=1.0):
     """Construct a 4x4 Blender matrix from ARDY position and 3x3 rotation."""
@@ -1584,11 +1585,10 @@ def get_skin_path(paths, J):
         return os.path.join(paths["ardy_dir"], "ardy", "assets", "skeletons", skel_dir, "skin_standard.npz")
     return candidate_paths[0]
 
-def setup_soma_skin(context, parent_obj=None, J=27, scale=1.0, paths=None, char_name=None, skin_path=None):
+def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None, skin_path=None):
     try:
         import numpy as np
     except ImportError:
-        print("[CEB Ardy] NumPy is required to setup Ardy skin.")
         return None, None
         
     if not skin_path:
@@ -1617,15 +1617,7 @@ def setup_soma_skin(context, parent_obj=None, J=27, scale=1.0, paths=None, char_
 
     clean_prefix = char_name.replace(" ", "_") if char_name else ("Core" if J == 27 else "SOMA")
 
-    # 1. Create Armature
-    arm_data = bpy.data.armatures.new(f"{clean_prefix}_Armature_Data")
-    arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
-    context.scene.collection.objects.link(arm_obj)
-    arm_obj.rotation_euler = (0, 0, 0)
-    if parent_obj:
-        arm_obj.parent = parent_obj
-
-    # 2. Create Mesh & Parent directly to Armature
+    # 1. Create Mesh
     mesh_data = bpy.data.meshes.new(name=f"{clean_prefix}_Skin_Mesh")
     mesh_obj = bpy.data.objects.new(f"{clean_prefix}_Skin", mesh_data)
     context.scene.collection.objects.link(mesh_obj)
@@ -1635,7 +1627,15 @@ def setup_soma_skin(context, parent_obj=None, J=27, scale=1.0, paths=None, char_
     mesh_data.from_pydata(verts, [], faces_list)
     mesh_data.update()
     
-    mesh_obj.parent = arm_obj
+    if parent_obj:
+        mesh_obj.parent = parent_obj
+    
+    # 2. Create Armature
+    arm_data = bpy.data.armatures.new(f"{clean_prefix}_Armature_Data")
+    arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
+    context.scene.collection.objects.link(arm_obj)
+    if parent_obj:
+        arm_obj.parent = parent_obj
     
     # Add Armature Modifier
     arm_mod = mesh_obj.modifiers.new(name=f"{clean_prefix}_Armature_Mod", type='ARMATURE')
@@ -2232,12 +2232,18 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
         mesh_name = f"{clean_prefix}_Skin"
         parent_name = f"ARDY_Character_{clean_prefix}"
 
-        for obj_name in (arm_name, mesh_name, parent_name):
+        for obj_name in (arm_name, mesh_name):
             obj = bpy.data.objects.get(obj_name)
             if obj:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
-        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=char_name)
+        parent_obj = bpy.data.objects.get(parent_name)
+        if not parent_obj:
+            parent_obj = bpy.data.objects.new(parent_name, None)
+            context.scene.collection.objects.link(parent_obj)
+            parent_obj.rotation_euler = (0, 0, 0)
+
+        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name)
         if not arm_obj:
             self.report({'ERROR'}, f"Failed to build mesh and armature for {char.name}.")
             return {'CANCELLED'}
@@ -2247,7 +2253,7 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
 
         char.arm_obj_name = arm_obj.name
         char.mesh_obj_name = f"{clean_prefix}_Skin"
-        char.parent_obj_name = ""
+        char.parent_obj_name = parent_obj.name
 
         self.report({'INFO'}, f"Character loaded: {arm_obj.name} ({J} joints, scale={scale})")
         return {'FINISHED'}
@@ -2273,13 +2279,19 @@ class CEB_OT_LoadArdyCore(bpy.types.Operator):
         mesh_name = f"{clean_prefix}_Skin"
         parent_name = f"ARDY_Character_{clean_prefix}"
 
-        for obj_name in (arm_name, mesh_name, parent_name):
+        for obj_name in (arm_name, mesh_name):
             obj = bpy.data.objects.get(obj_name)
             if obj:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
+        parent_obj = bpy.data.objects.get(parent_name)
+        if not parent_obj:
+            parent_obj = bpy.data.objects.new(parent_name, None)
+            context.scene.collection.objects.link(parent_obj)
+            parent_obj.rotation_euler = (0, 0, 0)
+
         arm_obj, rig_joint_names = setup_soma_skin(
-            context, parent_obj=None, J=27, scale=1.0, paths=paths, char_name=clean_prefix, skin_path=skin_path
+            context, parent_obj, J=27, scale=1.0, paths=paths, char_name=clean_prefix, skin_path=skin_path
         )
 
         if not arm_obj:
@@ -2888,17 +2900,22 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         mesh_obj = bpy.data.objects.get(mesh_name)
 
         if not arm_obj or not mesh_obj or len(arm_obj.pose.bones) == 0:
-            for o_name in (arm_name, mesh_name, parent_name):
-                if o_name:
-                    o_obj = bpy.data.objects.get(o_name)
-                    if o_obj:
-                        bpy.data.objects.remove(o_obj, do_unlink=True)
+            parent_obj = bpy.data.objects.get(parent_name)
+            if not parent_obj:
+                parent_obj = bpy.data.objects.new(parent_name, None)
+                context.scene.collection.objects.link(parent_obj)
+                parent_obj.rotation_euler = (0, 0, 0)
 
-            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=char_name_str)
+            if arm_obj and not mesh_obj:
+                bpy.data.objects.remove(arm_obj, do_unlink=True)
+            elif mesh_obj and not arm_obj:
+                bpy.data.objects.remove(mesh_obj, do_unlink=True)
+
+            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name_str)
             if char:
                 char.arm_obj_name = arm_obj.name
                 char.mesh_obj_name = f"{clean_prefix}_Skin"
-                char.parent_obj_name = ""
+                char.parent_obj_name = parent_obj.name
         else:
             rig_joint_names = [b.name for b in arm_obj.pose.bones]
 

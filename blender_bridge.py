@@ -561,7 +561,7 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                             if root_constraint is not None:
                                                 import torch
                                                 # Convert Blender world coordinates (wp_xb, wp_yb, wp_zb) -> ARDY model space
-                                                wp_x_ardy = wp_xb - accum_offset_x
+                                                wp_x_ardy = -wp_xb - accum_offset_x
                                                 wp_z_ardy = wp_yb - accum_offset_z
                                                 root_pos_ardy = torch.tensor([wp_x_ardy, 0.0, wp_z_ardy], dtype=torch.float32)
                                                 wp_id = f"waypoint_{wp_frame}"
