@@ -24,6 +24,9 @@ bl_info = {
 ### - keyboard based velocity
 ### - Kinematic constraints 
 
+### - retirar o empty quando carregar o personagem
+### - ajustar para a simulatcao funcionar mesmo se o character nao estiver no centro do 3dview
+
 import bpy
 from bpy.props import StringProperty
 

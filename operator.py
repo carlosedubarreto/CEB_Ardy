@@ -1627,15 +1627,15 @@ def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None, skin_p
     mesh_data.from_pydata(verts, [], faces_list)
     mesh_data.update()
     
-    if parent_obj:
-        mesh_obj.parent = parent_obj
-    
     # 2. Create Armature
     arm_data = bpy.data.armatures.new(f"{clean_prefix}_Armature_Data")
     arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
     context.scene.collection.objects.link(arm_obj)
     if parent_obj:
         arm_obj.parent = parent_obj
+
+    # Parent mesh directly to the armature
+    mesh_obj.parent = arm_obj
     
     # Add Armature Modifier
     arm_mod = mesh_obj.modifiers.new(name=f"{clean_prefix}_Armature_Mod", type='ARMATURE')
@@ -2237,18 +2237,13 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
         mesh_name = f"{clean_prefix}_Skin"
         parent_name = f"ARDY_Character_{clean_prefix}"
 
-        for obj_name in (arm_name, mesh_name):
-            obj = bpy.data.objects.get(obj_name)
-            if obj:
-                bpy.data.objects.remove(obj, do_unlink=True)
+        for obj_name in (arm_name, mesh_name, parent_name, char.parent_obj_name):
+            if obj_name:
+                obj = bpy.data.objects.get(obj_name)
+                if obj:
+                    bpy.data.objects.remove(obj, do_unlink=True)
 
-        parent_obj = bpy.data.objects.get(parent_name)
-        if not parent_obj:
-            parent_obj = bpy.data.objects.new(parent_name, None)
-            context.scene.collection.objects.link(parent_obj)
-            parent_obj.rotation_euler = (0, 0, 0)
-
-        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name)
+        arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=char_name)
         if not arm_obj:
             self.report({'ERROR'}, f"Failed to build mesh and armature for {char.name}.")
             return {'CANCELLED'}
@@ -2258,7 +2253,7 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
 
         char.arm_obj_name = arm_obj.name
         char.mesh_obj_name = f"{clean_prefix}_Skin"
-        char.parent_obj_name = parent_obj.name
+        char.parent_obj_name = ""
 
         self.report({'INFO'}, f"Character loaded: {arm_obj.name} ({J} joints, scale={scale})")
         return {'FINISHED'}
@@ -2284,19 +2279,13 @@ class CEB_OT_LoadArdyCore(bpy.types.Operator):
         mesh_name = f"{clean_prefix}_Skin"
         parent_name = f"ARDY_Character_{clean_prefix}"
 
-        for obj_name in (arm_name, mesh_name):
+        for obj_name in (arm_name, mesh_name, parent_name):
             obj = bpy.data.objects.get(obj_name)
             if obj:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
-        parent_obj = bpy.data.objects.get(parent_name)
-        if not parent_obj:
-            parent_obj = bpy.data.objects.new(parent_name, None)
-            context.scene.collection.objects.link(parent_obj)
-            parent_obj.rotation_euler = (0, 0, 0)
-
         arm_obj, rig_joint_names = setup_soma_skin(
-            context, parent_obj, J=27, scale=1.0, paths=paths, char_name=clean_prefix, skin_path=skin_path
+            context, parent_obj=None, J=27, scale=1.0, paths=paths, char_name=clean_prefix, skin_path=skin_path
         )
 
         if not arm_obj:
@@ -2905,22 +2894,22 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         mesh_obj = bpy.data.objects.get(mesh_name)
 
         if not arm_obj or not mesh_obj or len(arm_obj.pose.bones) == 0:
-            parent_obj = bpy.data.objects.get(parent_name)
-            if not parent_obj:
-                parent_obj = bpy.data.objects.new(parent_name, None)
-                context.scene.collection.objects.link(parent_obj)
-                parent_obj.rotation_euler = (0, 0, 0)
+            for p_name in (parent_name, char.parent_obj_name if char else None):
+                if p_name:
+                    p_obj = bpy.data.objects.get(p_name)
+                    if p_obj:
+                        bpy.data.objects.remove(p_obj, do_unlink=True)
 
             if arm_obj and not mesh_obj:
                 bpy.data.objects.remove(arm_obj, do_unlink=True)
             elif mesh_obj and not arm_obj:
                 bpy.data.objects.remove(mesh_obj, do_unlink=True)
 
-            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj, J, scale, paths, char_name=char_name_str)
+            arm_obj, rig_joint_names = setup_soma_skin(context, parent_obj=None, J=J, scale=scale, paths=paths, char_name=char_name_str)
             if char:
                 char.arm_obj_name = arm_obj.name
                 char.mesh_obj_name = f"{clean_prefix}_Skin"
-                char.parent_obj_name = parent_obj.name
+                char.parent_obj_name = ""
         else:
             rig_joint_names = [b.name for b in arm_obj.pose.bones]
 
