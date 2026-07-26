@@ -3101,18 +3101,29 @@ def align_rig_to_pose_armature(orig_arm, rig_obj):
             if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
                 bpy.context.view_layer.update()
 
-    # Align IK target controls (hands and feet) taking Child Of constraints into account
+    # Align IK target controls (hands and feet) taking Child Of constraints and qr_offset rest matrices into account
     ik_targets = [
-        ('c_hand_ik.r', 'RightHand'),
-        ('c_hand_ik.l', 'LeftHand'),
-        ('c_foot_ik.r', 'RightFoot'),
-        ('c_foot_ik.l', 'LeftFoot'),
+        ('c_hand_ik.r', 'RightHand', 'RightHand_qr_offset'),
+        ('c_hand_ik.l', 'LeftHand', 'LeftHand_qr_offset'),
+        ('c_foot_ik.r', 'RightFoot', 'RightFoot_qr_offset'),
+        ('c_foot_ik.l', 'LeftFoot', 'LeftFoot_qr_offset'),
     ]
-    for ik_b, arm_b in ik_targets:
+    ik_offsets = {}
+    for ik_b, arm_b, qr_b in ik_targets:
+        if ik_b in rig_obj.pose.bones and qr_b in rig_obj.data.bones:
+            qr_rest_wmat = rig_obj.matrix_world @ rig_obj.data.bones[qr_b].matrix_local
+            ik_rest_wmat = rig_obj.matrix_world @ rig_obj.data.bones[ik_b].matrix_local
+            ik_offsets[ik_b] = qr_rest_wmat.inverted() @ ik_rest_wmat
+
+    for ik_b, arm_b, qr_b in ik_targets:
         if ik_b in rig_obj.pose.bones and arm_b in orig_arm.pose.bones:
             pb = rig_obj.pose.bones[ik_b]
-            target_wmat = orig_arm.matrix_world @ orig_arm.pose.bones[arm_b].matrix
-            
+            orig_wmat = orig_arm.matrix_world @ orig_arm.pose.bones[arm_b].matrix
+            if ik_b in ik_offsets:
+                target_wmat = orig_wmat @ ik_offsets[ik_b]
+            else:
+                target_wmat = orig_wmat
+                
             childof = next((c for c in pb.constraints if c.type == 'CHILD_OF' and c.influence > 0), None)
             if childof and childof.subtarget in rig_obj.pose.bones:
                 sub_wmat = rig_obj.matrix_world @ rig_obj.pose.bones[childof.subtarget].matrix
@@ -3123,30 +3134,52 @@ def align_rig_to_pose_armature(orig_arm, rig_obj):
             if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
                 bpy.context.view_layer.update()
 
-    # Set pole targets for IK elbows/knees
-    def set_pole(shoulder_name, elbow_name, hand_name, pole_name):
+    # Set pole targets for IK elbows (behind) and knees (in front) taking Child Of constraints into account
+    def set_pole(shoulder_name, elbow_name, hand_name, pole_name, is_leg=False):
         if all(b in orig_arm.pose.bones for b in (shoulder_name, elbow_name, hand_name)) and pole_name in rig_obj.pose.bones:
             p_sh = (orig_arm.matrix_world @ orig_arm.pose.bones[shoulder_name].matrix).to_translation()
             p_el = (orig_arm.matrix_world @ orig_arm.pose.bones[elbow_name].matrix).to_translation()
             p_hd = (orig_arm.matrix_world @ orig_arm.pose.bones[hand_name].matrix).to_translation()
+            
+            char_fwd = (orig_arm.matrix_world.to_quaternion() @ mathutils.Vector((0, 1, 0))).normalized()
+            
             v_sh_hd = (p_hd - p_sh)
             if v_sh_hd.length > 1e-4:
                 v_sh_hd_n = v_sh_hd.normalized()
                 proj = p_sh + v_sh_hd_n * (p_el - p_sh).dot(v_sh_hd_n)
                 pole_vec = (p_el - proj)
                 if pole_vec.length > 1e-4:
-                    pole_pos = p_el + pole_vec.normalized() * 0.5
+                    pole_dir = pole_vec.normalized()
                 else:
-                    pole_pos = p_el + mathutils.Vector((0, -0.5, 0))
+                    pole_dir = char_fwd if is_leg else -char_fwd
             else:
-                pole_pos = p_el + mathutils.Vector((0, -0.5, 0))
-            mat = mathutils.Matrix.Translation(pole_pos)
-            rig_obj.pose.bones[pole_name].matrix = rig_inv @ mat
+                pole_dir = char_fwd if is_leg else -char_fwd
+                
+            if is_leg:
+                if pole_dir.dot(char_fwd) < 0:
+                    pole_dir = -pole_dir
+            else:
+                if pole_dir.dot(char_fwd) > 0:
+                    pole_dir = -pole_dir
+                    
+            pole_pos = p_el + pole_dir * 0.5
+            
+            target_wmat = mathutils.Matrix.Translation(pole_pos)
+            pb = rig_obj.pose.bones[pole_name]
+            childof = next((c for c in pb.constraints if c.type == 'CHILD_OF' and c.influence > 0), None)
+            if childof and childof.subtarget in rig_obj.pose.bones:
+                sub_wmat = rig_obj.matrix_world @ rig_obj.pose.bones[childof.subtarget].matrix
+                child_wmat = sub_wmat @ childof.inverse_matrix
+                pb.matrix = child_wmat.inverted() @ target_wmat
+            else:
+                pb.matrix = rig_inv @ target_wmat
+            if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
+                bpy.context.view_layer.update()
 
-    set_pole('RightArm', 'RightForeArm', 'RightHand', 'c_arms_pole.r')
-    set_pole('LeftArm', 'LeftForeArm', 'LeftHand', 'c_arms_pole.l')
-    set_pole('RightUpLeg', 'RightLeg', 'RightFoot', 'c_leg_pole.r')
-    set_pole('LeftUpLeg', 'LeftLeg', 'LeftFoot', 'c_leg_pole.l')
+    set_pole('RightArm', 'RightForeArm', 'RightHand', 'c_arms_pole.r', is_leg=False)
+    set_pole('LeftArm', 'LeftForeArm', 'LeftHand', 'c_arms_pole.l', is_leg=False)
+    set_pole('RightUpLeg', 'RightLeg', 'RightFoot', 'c_leg_pole.r', is_leg=True)
+    set_pole('LeftUpLeg', 'LeftLeg', 'LeftFoot', 'c_leg_pole.l', is_leg=True)
 
 def cleanup_ik_control_collection(context):
     """Unlink and delete all objects and collection imported for IK control."""
