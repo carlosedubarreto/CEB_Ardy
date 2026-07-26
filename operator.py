@@ -3076,10 +3076,14 @@ def align_rig_to_pose_armature(orig_arm, rig_obj):
         ('LeftFoot', 'c_foot_fk.l', 'LeftFoot_qr_offset'),
     ]
 
-    # Set IK mode on all limb pose bones
+    # Set IK mode and pole parenting on pose bones
     for pb in rig_obj.pose.bones:
         if 'ik_fk_switch' in pb:
             pb['ik_fk_switch'] = 0.0
+        if 'pole_parent' in pb:
+            pb['pole_parent'] = 1
+        if 'pole_parenting' in pb:
+            pb['pole_parenting'] = 1
 
     # Calculate control offsets relative to qr_offset rest matrices
     offsets = {}
