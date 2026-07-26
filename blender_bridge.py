@@ -408,6 +408,7 @@ def run_server(port, model_name="core", quantize_4bit=False):
         return
 
     current_prompt = "walk"
+    current_reset_id = 0
     frame_num = 0
     accum_offset_x = 0.0
     accum_offset_z = 0.0
@@ -445,7 +446,7 @@ def run_server(port, model_name="core", quantize_4bit=False):
                             line, buf = buf.split("\n", 1)
                             line = line.strip()
                             if line.startswith("SWITCH_CHAR:"):
-                                # Syntax: SWITCH_CHAR:char_name:model:prompt:frame:x:y:z:heading
+                                # Syntax: SWITCH_CHAR:char_name:model:prompt:frame:x:y:z:heading:reset_id
                                 try:
                                     parts = line.split(":")
                                     if len(parts) >= 9:
@@ -458,8 +459,9 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                         char_y = float(parts[6])
                                         char_z = float(parts[7])
                                         char_heading = float(parts[8])
+                                        current_reset_id = int(parts[9]) if len(parts) >= 10 else 0
 
-                                        print(f"[Bridge] SWITCH_CHAR: '{char_name}' (model={new_model}) at Blender pos=({char_x:.2f}, {char_y:.2f}, {char_z:.2f}), heading={char_heading:.2f}, prompt='{new_prompt}'")
+                                        print(f"[Bridge] SWITCH_CHAR: '{char_name}' (model={new_model}) at Blender pos=({char_x:.2f}, {char_y:.2f}, {char_z:.2f}), heading={char_heading:.2f}, prompt='{new_prompt}', reset_id={current_reset_id}")
                                         
                                         current_prompt = new_prompt
                                         frame_num = blender_frame
@@ -485,14 +487,14 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                             reset_generator_session(generator, current_prompt)
                                             
                                             # 3. Setup the initial position and rotation in ARDY space
-                                            # Blender (X, Y, Z) -> ARDY (X, 0.0, Y)
-                                            session.init_global_translation = np.array([char_x, 0.0, char_y], dtype=np.float32)
+                                            # Blender (X, Y, Z) -> ARDY (-X, 0.0, Y)
+                                            session.init_global_translation = np.array([-char_x, 0.0, char_y], dtype=np.float32)
                                             session.init_first_heading_angle = char_heading
                                             
                                             # 4. Setup starting offset variables for correct shifting
                                             accum_offset_x = 0.0
                                             accum_offset_z = 0.0
-                                            last_sent_root = [char_x, char_z, char_y]
+                                            last_sent_root = [-char_x, 0.0, char_y]
                                             prompt_just_changed = False
                                 except Exception as e:
                                     print(f"[Bridge] Error handling SWITCH_CHAR command: {e}")
@@ -732,6 +734,7 @@ def run_server(port, model_name="core", quantize_4bit=False):
                 "frame": frame_num,
                 "joints": joints,
                 "prompt": current_prompt,
+                "reset_id": current_reset_id,
             }
             if rot_list is not None:
                 payload["global_rot_mats"] = rot_list

@@ -17,15 +17,21 @@ bl_info = {
 ### OK - add option to get the current pose and add as constraint
 ### OK - multiple characters
 ### OK - autosave animation as NLA strip at each run
-### - retarget from sam 3d  body result (nao para agora, tive muitos problemas)
-### - list of nla strip recorded (name is the prompts) (TALVEZ) , pois ja tenho essa função no SAM
-
 ### OK - portable python enable quantization webapp
+
+### WIP 4.1
+### OK - retirar o empty quando carregar o personagem
+### OK - ajustar para a simulatcao funcionar mesmo se o character nao estiver no centro do 3dview
+
+### wip5
+### OK - update para blender 5.2 
+### - Temp Ik to control the pose easily
+
 ### - keyboard based velocity
 ### - Kinematic constraints 
 
-### - retirar o empty quando carregar o personagem
-### - ajustar para a simulatcao funcionar mesmo se o character nao estiver no centro do 3dview
+### - retarget from sam 3d  body result (nao para agora, tive muitos problemas)
+### - list of nla strip recorded (name is the prompts) (TALVEZ) , pois ja tenho essa função no SAM
 
 import bpy
 from bpy.props import StringProperty

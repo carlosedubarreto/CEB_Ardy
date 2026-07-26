@@ -56,9 +56,11 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             return
             
         props = scene.ceb_ardy
+        is_ik_active = props.ik_control_active
 
         # --- ARDY Path Settings ---
         box = layout.box()
+        box.enabled = not is_ik_active
         box.label(text="Path Settings", icon='FOLDER_REDIRECT')
         
         package_name = __package__ if __package__ else "CEB_Ardy"
@@ -82,6 +84,14 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                     row.label(text="Python & ARDY detected", icon='CHECKMARK')
         else:
             box.label(text="Addon preferences not registered.", icon='ERROR')
+        # --- Standalone Viser Web App ---
+        box_viser = layout.box()
+        box_viser.enabled = not is_ik_active
+        box_viser.label(text="Viser Web App", icon='URL')
+        viser_row = box_viser.row(align=True)
+        viser_row.scale_y = 1.1
+        viser_row.enabled = is_path_set and (not is_ik_active)
+        viser_row.operator("ceb.ardy_run_demo", text="Start Viser Web App", icon='URL')
 
         # Ensure active character exists
         from .operator import get_active_character
@@ -89,6 +99,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
 
         # --- Character Selector ---
         box = layout.box()
+        box.enabled = not is_ik_active
         box.label(text="Character Selection", icon='OUTLINER_OB_ARMATURE')
         
         row = box.row()
@@ -112,57 +123,52 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
 
         # --- Real-Time Control ---
         box = layout.box()
+        box.enabled = not is_ik_active
         box.label(text="Real-Time Control", icon='ORIENTATION_PARENT')
         
-        status_icon = 'ERROR' if props.realtime_status == "Disconnected" else 'CHECKMARK'
+        is_connected = (props.realtime_status == "Connected")
+        status_icon = 'CHECKMARK' if is_connected else 'ERROR'
+        
         row = box.row()
         row.label(text=f"Status: {props.realtime_status}", icon=status_icon)
         row.prop(props, "realtime_port", text="Port")
         
         box.prop(props, "quantize_4bit", text="4-bit Quantization (VRAM Save)")
         box.prop(props, "mute_previous_nla_layers", text="Mute Previous NLA Layers")
-
-        # if char:
-        #     row = box.row(align=True)
-        #     row.enabled = is_path_set
-        #     row.operator("ceb.load_character", text=f"Load / Build {char.name}", icon='ARMATURE_DATA')
         
         row = box.row(align=True)
         row.operator("ceb.clean_animation", text="Clean Animation", icon='TRASH')
         
+        # Bridge Server Controls
         row = box.row(align=True)
-        row.scale_y = 1.1
-        row.enabled = is_path_set or (props.realtime_status == "Connected")
+        row.scale_y = 1.2
+        row.enabled = (is_path_set or is_connected) and (not is_ik_active)
         row.operator("ceb.ardy_start_bridge", text="Start Bridge", icon='PLAY')
-        row.operator("ceb.ardy_run_demo", text="Start Viser Web App", icon='URL')
-        
-        stream_text = "Disconnect Stream" if props.realtime_status == "Connected" else "Connect Stream"
-        stream_icon = 'CANCEL' if props.realtime_status == "Connected" else 'LINK_BLEND'
-        row.operator("ceb.ardy_realtime_stream", text=stream_text, icon=stream_icon)
-        
-        if props.realtime_status == "Connected" and char:
-            box.prop(char, "realtime_prompt", text=f"Live Prompt ({char.name})")
 
-        # --- Retarget Animation ---
-        # if char:
-        #     box = layout.box()
-        #     box.label(text="Retarget Animation", icon='CON_ARMATURE')
-        #     box.prop_search(props, "source_armature_name", context.scene, "objects", text="Source Armature")
-        #     box.prop(props, "retarget_flip_180", text="180° Facing Correction")
-        #     row = box.row(align=True)
-        #     op = row.operator("ceb.retarget_mhr", text=f"Retarget to {char.name}", icon='ARMATURE_DATA')
-        #     if props.source_armature_name:
-        #         op.source_armature_name = props.source_armature_name
+        # Connect / Disconnect Stream Controls (Fixed position, depress highlight when connected)
+        stream_text = "Disconnect Stream" if is_connected else "Connect Stream"
+        stream_icon = 'CANCEL' if is_connected else 'LINK_BLEND'
+            
+        stream_row = box.row(align=True)
+        stream_row.scale_y = 1.5
+        stream_row.enabled = (is_path_set or is_connected) and (not is_ik_active)
+        stream_row.operator("ceb.ardy_realtime_stream", text=stream_text, icon=stream_icon, depress=is_connected)
+        
+        # Show Live Prompt ONLY if stream is connected and prompt schedule list is empty
+        if is_connected and char and len(char.prompt_schedule) == 0:
+            box.prop(char, "realtime_prompt", text=f"Live Prompt ({char.name})")
 
         # --- Prompt Schedule ---
         if char:
             box = layout.box()
             header = box.row(align=True)
+            header.enabled = not is_ik_active
             header.label(text=f"Prompt Schedule ({char.name})", icon='TIME')
             header.prop(props, "overlay_view_mode", text="")
             header.prop(props, "show_prompt_overlay", text="", icon='OVERLAY')
             
             row = box.row()
+            row.enabled = not is_ik_active
             row.template_list(
                 "CEB_UL_PromptList", "",
                 char, "prompt_schedule",
@@ -171,6 +177,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             )
             
             col = row.column(align=True)
+            col.enabled = not is_ik_active
             col.operator("ceb.add_prompt_item", text="", icon='ADD')
             col.operator("ceb.add_waypoint", text="", icon='ORIENTATION_LOCAL')
             col.operator("ceb.add_pose_constraint", text="", icon='ARMATURE_DATA')
@@ -188,6 +195,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                 selected_item = char.prompt_schedule[char.prompt_schedule_index]
                 wp_box = box.box()
                 if selected_item.has_waypoint:
+                    wp_box.enabled = not is_ik_active
                     wp_row = wp_box.row(align=True)
                     wp_row.prop(selected_item, "has_waypoint", text="3D Waypoint Target")
                     wp_row.operator("ceb.remove_waypoint", text="", icon='X')
@@ -197,11 +205,26 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                         wp_box.label(text=f"Linked Empty: {selected_item.waypoint_object_name}", icon='EMPTY_DATA')
                 elif getattr(selected_item, "has_pose_constraint", False):
                     pc_row = wp_box.row(align=True)
+                    pc_row.enabled = not is_ik_active
                     pc_row.prop(selected_item, "has_pose_constraint", text="Pose Constraint Target")
                     pc_row.operator("ceb.capture_pose_constraint", text="Re-capture Pose", icon='POSE_HLT')
                     pc_row.operator("ceb.remove_pose_constraint", text="", icon='X')
                     if selected_item.pose_armature_name:
                         wp_box.label(text=f"Target Armature: {selected_item.pose_armature_name}", icon='POSE_HLT')
+                        
+                        ik_box = wp_box.box()
+                        if is_ik_active:
+                            ik_box.alert = True
+                            ik_box.label(text=f"IK Control Active ({props.ik_original_armature_name})", icon='CONSTRAINT_BONE')
+                            ik_row = ik_box.row(align=True)
+                            ik_row.scale_y = 1.3
+                            ik_row.operator("ceb.bake_ik_pose", text="Bake Pose to Constraint", icon='CHECKMARK')
+                            ik_row.operator("ceb.cancel_ik_control", text="Cancel IK", icon='CANCEL')
+                        else:
+                            ik_row = ik_box.row(align=True)
+                            ik_row.scale_y = 1.2
+                            ik_row.operator("ceb.start_ik_control", text="IK Control", icon='CONSTRAINT_BONE')
+
 
 classes = (
     CEB_UL_CharacterList,

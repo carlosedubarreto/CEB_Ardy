@@ -402,10 +402,11 @@ def sync_prompt_item_object_names(item, context=None):
         arm_name = getattr(item, "pose_armature_name", "")
         obj = bpy.data.objects.get(arm_name) if arm_name else None
         
-        # Fallback search if arm_name was lost or not set properly
+        # Fallback search specifically matching this item's frame if exact name lookup missed
         if not obj:
+            target_suffix = f"Ardy_Pose_F{item.start_frame}"
             for candidate in list(bpy.data.objects):
-                if candidate.type == 'ARMATURE' and ("Ardy_Pose_F" in candidate.name or candidate.name.startswith("ARDY_Pose_F")):
+                if candidate.type == 'ARMATURE' and target_suffix in candidate.name:
                     obj = candidate
                     break
 
@@ -429,9 +430,11 @@ def sync_prompt_item_object_names(item, context=None):
         wp_name = getattr(item, "waypoint_object_name", "")
         wp_obj = bpy.data.objects.get(wp_name) if wp_name else None
 
+        # Fallback search specifically matching this item's frame if exact name lookup missed
         if not wp_obj:
+            target_suffix = f"Ardy_waypoint_F{item.start_frame}"
             for candidate in list(bpy.data.objects):
-                if candidate.type == 'EMPTY' and ("Ardy_waypoint_F" in candidate.name or candidate.name.startswith("ARDY_Waypoint_F")):
+                if candidate.type == 'EMPTY' and target_suffix in candidate.name:
                     wp_obj = candidate
                     break
 
@@ -618,7 +621,7 @@ def get_character_world_transform(char):
     arm_obj = bpy.data.objects.get(arm_name)
     
     if arm_obj:
-        root_bone = arm_obj.pose.bones[0] if arm_obj.pose.bones else None
+        root_bone = arm_obj.pose.bones[0] if (arm_obj.pose and arm_obj.pose.bones) else None
         if root_bone:
             world_matrix = arm_obj.matrix_world @ root_bone.matrix
         else:
@@ -640,6 +643,37 @@ def get_character_world_transform(char):
             char_heading = parent_obj.matrix_world.to_euler().z
             
     return char_x, char_y, char_z, char_heading
+
+_reset_id_counter = 0
+
+def send_switch_char_cmd(char, active_prompt, frame, context):
+    global _reset_id_counter, _realtime_client, _active_stream_operator
+    _reset_id_counter += 1
+    reset_id = _reset_id_counter
+
+    if _active_stream_operator is not None:
+        _active_stream_operator._current_reset_id = reset_id
+        _active_stream_operator._frame_queue = []
+        _active_stream_operator._buffer = ""
+        _active_stream_operator._reset_pending = True
+
+    char_x, char_y, char_z, char_heading = get_character_world_transform(char)
+    model = char.model if char else 'core'
+    char_name = char.name if char else 'Character_1'
+    cmd = f"SWITCH_CHAR:{char_name}:{model}:{active_prompt}:{frame}:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}:{reset_id}\n"
+    
+    if _realtime_client:
+        try:
+            _realtime_client.sendall(cmd.encode("utf-8"))
+            if _active_stream_operator is not None:
+                _active_stream_operator._start_frame = frame
+                _active_stream_operator._last_sent_prompt = active_prompt
+            send_waypoints_to_bridge(context, start_frame=frame)
+            send_pose_constraints_to_bridge(context, start_frame=frame)
+            print(f"[CEB Ardy] Sent SWITCH_CHAR for '{char_name}' at pos=({char_x:.2f},{char_y:.2f},{char_z:.2f}), reset_id={reset_id}")
+        except Exception as e:
+            print(f"[CEB Ardy] Error sending SWITCH_CHAR command: {e}")
+    return reset_id
 
 def update_active_character(self, context):
     tag_redraw_view3d(context)
@@ -670,20 +704,7 @@ def update_active_character(self, context):
         if char:
             current_frame = context.scene.frame_current if hasattr(context, "scene") else 0
             active_prompt = get_active_prompt_for_frame(context.scene.ceb_ardy, current_frame, context=context)
-            try:
-                char_x, char_y, char_z, char_heading = get_character_world_transform(char)
-                switch_cmd = f"SWITCH_CHAR:{char.name}:{char.model}:{active_prompt}:{current_frame}:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}\n"
-                _realtime_client.sendall(switch_cmd.encode("utf-8"))
-                if _active_stream_operator is not None:
-                    _active_stream_operator._start_frame = current_frame
-                send_waypoints_to_bridge(context, start_frame=current_frame)
-                send_pose_constraints_to_bridge(context, start_frame=current_frame)
-                if _active_stream_operator is not None and hasattr(_active_stream_operator, "_frame_queue"):
-                    _active_stream_operator._frame_queue = []
-                    _active_stream_operator._last_sent_prompt = active_prompt
-                print(f"[CEB Ardy] Switched active character to '{char.name}' (pos={char_x:.2f},{char_y:.2f},{char_z:.2f}) → Synced bridge.")
-            except Exception as e:
-                print(f"[CEB Ardy] Error syncing active character to bridge: {e}")
+            send_switch_char_cmd(char, active_prompt, current_frame, context=context)
 
 class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     characters: bpy.props.CollectionProperty(
@@ -757,6 +778,21 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         description="Display real-time prompt overlay in 3D Viewport",
         default=False,
         update=update_overlay_visibility
+    )
+    ik_control_active: bpy.props.BoolProperty(
+        name="IK Control Active",
+        description="Whether IK control mode is active for pose editing",
+        default=False
+    )
+    ik_loaded_collection_name: bpy.props.StringProperty(
+        name="IK Collection Name",
+        description="Name of loaded IK rig collection",
+        default=""
+    )
+    ik_original_armature_name: bpy.props.StringProperty(
+        name="IK Original Armature Name",
+        description="Name of original pose constraint armature being edited",
+        default=""
     )
 
 class CEB_OT_AddCharacterEntry(bpy.types.Operator):
@@ -902,36 +938,23 @@ class CEB_OT_SortPromptItems(bpy.types.Operator):
         if not char:
             return {'CANCELLED'}
         schedule = char.prompt_schedule
-        if len(schedule) <= 1:
+        n = len(schedule)
+        if n <= 1:
             return {'FINISHED'}
 
-        items_data = []
+        # In-place selection sort using schedule.move(min_idx, i)
+        # This reorders collection items without clearing/re-adding or duplicating objects
+        for i in range(n):
+            min_idx = i
+            for j in range(i + 1, n):
+                if schedule[j].start_frame < schedule[min_idx].start_frame:
+                    min_idx = j
+            if min_idx != i:
+                schedule.move(min_idx, i)
+
+        # Sync object names for all items after reordering
         for item in schedule:
-            items_data.append({
-                "prompt": item.prompt,
-                "start_frame": item.start_frame,
-                "enabled": item.enabled,
-                "has_waypoint": item.has_waypoint,
-                "waypoint_co": mathutils.Vector(item.waypoint_co),
-                "waypoint_object_name": item.waypoint_object_name,
-                "has_pose_constraint": getattr(item, "has_pose_constraint", False),
-                "pose_armature_name": getattr(item, "pose_armature_name", ""),
-            })
-
-        items_data.sort(key=lambda x: x["start_frame"])
-
-        schedule.clear()
-        for d in items_data:
-            new_item = schedule.add()
-            new_item.prompt = d["prompt"]
-            new_item.start_frame = d["start_frame"]
-            new_item.enabled = d["enabled"]
-            new_item.has_waypoint = d["has_waypoint"]
-            new_item.waypoint_co = d["waypoint_co"]
-            new_item.waypoint_object_name = d["waypoint_object_name"]
-            new_item.has_pose_constraint = d["has_pose_constraint"]
-            new_item.pose_armature_name = d["pose_armature_name"]
-            sync_prompt_item_object_names(new_item, context)
+            sync_prompt_item_object_names(item, context)
 
         char.prompt_schedule_index = 0
         tag_redraw_view3d(context)
@@ -2181,11 +2204,7 @@ class CEB_OT_CleanAnimation(bpy.types.Operator):
                 _realtime_client.sendall(b"RESET\n")
                 if char:
                     active_prompt = get_active_prompt_for_frame(context.scene.ceb_ardy, 1, context=context)
-                    char_x, char_y, char_z, char_heading = get_character_world_transform(char)
-                    switch_cmd = f"SWITCH_CHAR:{char.name}:{char.model}:{active_prompt}:1:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}\n"
-                    _realtime_client.sendall(switch_cmd.encode("utf-8"))
-                    send_waypoints_to_bridge(context, start_frame=1)
-                    send_pose_constraints_to_bridge(context, start_frame=1)
+                    send_switch_char_cmd(char, active_prompt, 1, context=context)
                 sent = True
             except Exception as e:
                 print(f"[CEB Ardy] Failed to send RESET command over socket: {e}")
@@ -2370,6 +2389,33 @@ def get_stream_action_name(char):
     return f"{char_name}_{prompt_text}_W{num_waypoints}_C{num_constraints}"
 
 
+def action_has_curves(action):
+    """Safely check if an Action has curves or keyframes across all Blender versions (legacy vs slotted/layered)."""
+    if not action:
+        return False
+    try:
+        if hasattr(action, "is_empty"):
+            return not action.is_empty
+    except Exception:
+        pass
+    try:
+        if hasattr(action, "fcurves") and action.fcurves is not None:
+            return len(action.fcurves) > 0
+    except Exception:
+        pass
+    try:
+        if hasattr(action, "curves") and action.curves is not None:
+            return len(action.curves) > 0
+    except Exception:
+        pass
+    try:
+        if hasattr(action, "slots") and action.slots is not None:
+            return len(action.slots) > 0
+    except Exception:
+        pass
+    return False
+
+
 def push_action_to_nla_track(arm_obj, action):
     """
     Pushes an action onto a new NLA track for the armature object,
@@ -2383,7 +2429,7 @@ def push_action_to_nla_track(arm_obj, action):
 
     action.use_fake_user = True
 
-    start_frame = int(action.frame_range[0]) if len(action.fcurves) > 0 else 1
+    start_frame = int(action.frame_range[0]) if action_has_curves(action) else 1
 
     track = arm_obj.animation_data.nla_tracks.new()
     track.name = action.name
@@ -2426,7 +2472,7 @@ def prepare_armature_for_streaming(arm_obj, char, context=None):
     # 2. Remove active action strip from main action slot if any (push down first if it has keyframes)
     if anim_data.action:
         old_act = anim_data.action
-        if len(old_act.fcurves) > 0:
+        if action_has_curves(old_act):
             push_action_to_nla_track(arm_obj, old_act)
         anim_data.action = None
 
@@ -2757,7 +2803,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                     frame_num = payload.get("frame", 0)
                     global_rot_mats = payload.get("global_rot_mats", None)
                     char_name = payload.get("char_name", None)
-                    self.update_viewport(context, joints, frame_num, global_rot_mats=global_rot_mats, char_name=char_name)
+                    self.update_viewport(context, joints, frame_num, global_rot_mats=global_rot_mats, char_name=char_name, payload=payload)
 
         return {'PASS_THROUGH'}
 
@@ -2804,12 +2850,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
 
             self._last_sent_prompt = active_prompt
 
-            model = char.model if char else 'core'
-            char_x, char_y, char_z, char_heading = get_character_world_transform(char)
-            initial_cmd = f"SWITCH_CHAR:{char.name if char else 'Character_1'}:{model}:{active_prompt}:{current_frame}:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}\n"
-            _realtime_client.sendall(initial_cmd.encode("utf-8"))
-            send_waypoints_to_bridge(context, start_frame=current_frame)
-            send_pose_constraints_to_bridge(context, start_frame=current_frame)
+            send_switch_char_cmd(char, active_prompt, current_frame, context=context)
         except Exception as e:
             self.report({'ERROR'}, f"Connection failed: {e}. Is the Bridge Process running?")
             _realtime_client = None
@@ -2848,7 +2889,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             arm_obj = bpy.data.objects.get(arm_name)
             if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action:
                 act = arm_obj.animation_data.action
-                if len(act.fcurves) > 0:
+                if action_has_curves(act):
                     push_action_to_nla_track(arm_obj, act)
                 arm_obj.animation_data.action = None
 
@@ -2860,7 +2901,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         props.realtime_status = "Disconnected"
         self.report({'INFO'}, "ARDY stream disconnected.")
 
-    def update_viewport(self, context, joints, frame_num, global_rot_mats=None, char_name=None):
+    def update_viewport(self, context, joints, frame_num, global_rot_mats=None, char_name=None, payload=None):
         if not joints:
             return
 
@@ -2871,6 +2912,14 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         # Ignore stale frame packets belonging to a previous character prior to dynamic switch
         if char_name and char.name != char_name:
             return
+
+        # Ignore stale frame packets belonging to a previous reset session / character transform
+        if payload and isinstance(payload, dict):
+            packet_reset_id = payload.get("reset_id", None)
+            active_reset_id = getattr(self, "_current_reset_id", None)
+            if packet_reset_id is not None and active_reset_id is not None:
+                if packet_reset_id != active_reset_id:
+                    return
 
         props = context.scene.ceb_ardy
         scale = props.import_scale
@@ -2951,6 +3000,353 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         if props.realtime_recording:
             context.scene.frame_current += 1
 
+def copy_evaluated_pose_to_armature(src_arm, dst_arm):
+    """
+    Copy the evaluated pose from src_arm (which has constraints/IK)
+    to dst_arm (the pose constraint armature, without keyframes).
+    Uses exact topological matrix decomposition to achieve zero pose error.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    src_eval = src_arm.evaluated_get(depsgraph)
+
+    # Sort bones in root-to-leaf (parent-first) order
+    ordered_bones = []
+    def visit(b):
+        if b not in ordered_bones:
+            if b.parent and b.parent not in ordered_bones:
+                visit(b.parent)
+            ordered_bones.append(b)
+    for b in dst_arm.data.bones:
+        visit(b)
+
+    for b in ordered_bones:
+        dst_pb = dst_arm.pose.bones[b.name]
+        src_pb = src_eval.pose.bones.get(b.name)
+        if not src_pb:
+            continue
+
+        dst_pb.rotation_mode = 'QUATERNION'
+
+        if not b.parent:
+            rest_mat = b.matrix_local
+            pose_mat = src_pb.matrix
+            delta_mat = rest_mat.inverted() @ pose_mat
+            dst_pb.location = delta_mat.to_translation()
+            dst_pb.rotation_quaternion = delta_mat.to_quaternion()
+            dst_pb.scale = delta_mat.to_scale()
+        else:
+            parent_src_mat = src_pb.parent.matrix
+            rel_mat = parent_src_mat.inverted() @ src_pb.matrix
+            rel_rest = b.parent.matrix_local.inverted() @ b.matrix_local
+            delta_mat = rel_rest.inverted() @ rel_mat
+            dst_pb.location = delta_mat.to_translation()
+            dst_pb.rotation_quaternion = delta_mat.to_quaternion()
+            dst_pb.scale = delta_mat.to_scale()
+
+def align_rig_to_pose_armature(orig_arm, rig_obj):
+    """Align loaded Ardy_Core_rig controls to match orig_arm pose in IK mode."""
+    # 1. Match rig object world matrix with R_180 facing adjustment
+    R_180 = mathutils.Matrix.Rotation(math.pi, 4, 'Z')
+    rig_obj.matrix_world = orig_arm.matrix_world @ R_180
+    rig_inv = rig_obj.matrix_world.inverted()
+
+    # Controls mapping: (orig_arm bone, rig control bone, rig qr_offset bone)
+    controls_map = [
+        ('Hips', 'c_root.x', 'Hips_qr_offset'),
+        ('Spine', 'c_spine_01.x', 'Spine_qr_offset'),
+        ('Spine1', 'c_spine_02.x', 'Spine1_qr_offset'),
+        ('Spine2', 'c_spine_03.x', 'Spine2_qr_offset'),
+        ('Spine3', 'c_spine_04.x', 'Spine3_qr_offset'),
+        ('Neck', 'c_neck.x', 'Neck_qr_offset'),
+        ('Head', 'c_head.x', 'Head_qr_offset'),
+        ('RightShoulder', 'c_shoulder.r', 'RightShoulder_qr_offset'),
+        ('LeftShoulder', 'c_shoulder.l', 'LeftShoulder_qr_offset'),
+        ('RightArm', 'c_arm_fk.r', 'RightArm_qr_offset'),
+        ('RightForeArm', 'c_forearm_fk.r', 'RightForeArm_qr_offset'),
+        ('RightHand', 'c_hand_fk.r', 'RightHand_qr_offset'),
+        ('LeftArm', 'c_arm_fk.l', 'LeftArm_qr_offset'),
+        ('LeftForeArm', 'c_forearm_fk.l', 'LeftForeArm_qr_offset'),
+        ('LeftHand', 'c_hand_fk.l', 'LeftHand_qr_offset'),
+        ('RightUpLeg', 'c_thigh_fk.r', 'RightUpLeg_qr_offset'),
+        ('RightLeg', 'c_leg_fk.r', 'RightLeg_qr_offset'),
+        ('RightFoot', 'c_foot_fk.r', 'RightFoot_qr_offset'),
+        ('LeftUpLeg', 'c_thigh_fk.l', 'LeftUpLeg_qr_offset'),
+        ('LeftLeg', 'c_leg_fk.l', 'LeftLeg_qr_offset'),
+        ('LeftFoot', 'c_foot_fk.l', 'LeftFoot_qr_offset'),
+    ]
+
+    # Set IK mode on all limb pose bones
+    for pb in rig_obj.pose.bones:
+        if 'ik_fk_switch' in pb:
+            pb['ik_fk_switch'] = 0.0
+
+    # Calculate control offsets relative to qr_offset rest matrices
+    offsets = {}
+    for arm_b, ctrl_b, qr_b in controls_map:
+        if ctrl_b in rig_obj.pose.bones and qr_b in rig_obj.data.bones:
+            qr_rest_wmat = rig_obj.matrix_world @ rig_obj.data.bones[qr_b].matrix_local
+            ctrl_rest_wmat = rig_obj.matrix_world @ rig_obj.data.bones[ctrl_b].matrix_local
+            offsets[ctrl_b] = qr_rest_wmat.inverted() @ ctrl_rest_wmat
+
+    # Apply target pose from orig_arm to all controls
+    for arm_b, ctrl_b, qr_b in controls_map:
+        if arm_b in orig_arm.pose.bones and ctrl_b in rig_obj.pose.bones:
+            target_wmat = orig_arm.matrix_world @ orig_arm.pose.bones[arm_b].matrix
+            if ctrl_b in offsets:
+                ctrl_wmat = target_wmat @ offsets[ctrl_b]
+            else:
+                ctrl_wmat = target_wmat
+            rig_obj.pose.bones[ctrl_b].matrix = rig_inv @ ctrl_wmat
+            if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
+                bpy.context.view_layer.update()
+
+    # Align IK target controls (hands and feet) taking Child Of constraints into account
+    ik_targets = [
+        ('c_hand_ik.r', 'RightHand'),
+        ('c_hand_ik.l', 'LeftHand'),
+        ('c_foot_ik.r', 'RightFoot'),
+        ('c_foot_ik.l', 'LeftFoot'),
+    ]
+    for ik_b, arm_b in ik_targets:
+        if ik_b in rig_obj.pose.bones and arm_b in orig_arm.pose.bones:
+            pb = rig_obj.pose.bones[ik_b]
+            target_wmat = orig_arm.matrix_world @ orig_arm.pose.bones[arm_b].matrix
+            
+            childof = next((c for c in pb.constraints if c.type == 'CHILD_OF' and c.influence > 0), None)
+            if childof and childof.subtarget in rig_obj.pose.bones:
+                sub_wmat = rig_obj.matrix_world @ rig_obj.pose.bones[childof.subtarget].matrix
+                child_wmat = sub_wmat @ childof.inverse_matrix
+                pb.matrix = child_wmat.inverted() @ target_wmat
+            else:
+                pb.matrix = rig_inv @ target_wmat
+            if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
+                bpy.context.view_layer.update()
+
+    # Set pole targets for IK elbows/knees
+    def set_pole(shoulder_name, elbow_name, hand_name, pole_name):
+        if all(b in orig_arm.pose.bones for b in (shoulder_name, elbow_name, hand_name)) and pole_name in rig_obj.pose.bones:
+            p_sh = (orig_arm.matrix_world @ orig_arm.pose.bones[shoulder_name].matrix).to_translation()
+            p_el = (orig_arm.matrix_world @ orig_arm.pose.bones[elbow_name].matrix).to_translation()
+            p_hd = (orig_arm.matrix_world @ orig_arm.pose.bones[hand_name].matrix).to_translation()
+            v_sh_hd = (p_hd - p_sh)
+            if v_sh_hd.length > 1e-4:
+                v_sh_hd_n = v_sh_hd.normalized()
+                proj = p_sh + v_sh_hd_n * (p_el - p_sh).dot(v_sh_hd_n)
+                pole_vec = (p_el - proj)
+                if pole_vec.length > 1e-4:
+                    pole_pos = p_el + pole_vec.normalized() * 0.5
+                else:
+                    pole_pos = p_el + mathutils.Vector((0, -0.5, 0))
+            else:
+                pole_pos = p_el + mathutils.Vector((0, -0.5, 0))
+            mat = mathutils.Matrix.Translation(pole_pos)
+            rig_obj.pose.bones[pole_name].matrix = rig_inv @ mat
+
+    set_pole('RightArm', 'RightForeArm', 'RightHand', 'c_arms_pole.r')
+    set_pole('LeftArm', 'LeftForeArm', 'LeftHand', 'c_arms_pole.l')
+    set_pole('RightUpLeg', 'RightLeg', 'RightFoot', 'c_leg_pole.r')
+    set_pole('LeftUpLeg', 'LeftLeg', 'LeftFoot', 'c_leg_pole.l')
+
+def cleanup_ik_control_collection(context):
+    """Unlink and delete all objects and collection imported for IK control."""
+    props = context.scene.ceb_ardy
+    coll_name = props.ik_loaded_collection_name
+    if not coll_name:
+        coll_name = "Ardy_Core_rig"
+
+    colls_to_remove = [c for c in bpy.data.collections if c.name == coll_name or c.name.startswith(f"{coll_name}.")]
+    for col in colls_to_remove:
+        for obj in list(col.all_objects):
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception as e:
+                print(f"[CEB Ardy] Error removing object '{obj.name}': {e}")
+        try:
+            bpy.data.collections.remove(col)
+        except Exception as e:
+            print(f"[CEB Ardy] Error removing collection '{col.name}': {e}")
+
+class CEB_OT_StartIKControl(bpy.types.Operator):
+    bl_idname = "ceb.start_ik_control"
+    bl_label = "IK Control"
+    bl_description = "Load IK Control rig to visually edit the selected pose constraint"
+
+    @classmethod
+    def poll(cls, context):
+        if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+            return False
+        props = context.scene.ceb_ardy
+        if props.ik_control_active:
+            return False
+        char = get_active_character(context)
+        if not char or not char.prompt_schedule:
+            return False
+        idx = char.prompt_schedule_index
+        if 0 <= idx < len(char.prompt_schedule):
+            item = char.prompt_schedule[idx]
+            if getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
+                obj = bpy.data.objects.get(item.pose_armature_name)
+                return obj is not None
+        return False
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        char = get_active_character(context)
+        if not char or not char.prompt_schedule:
+            self.report({'ERROR'}, "No active character or schedule.")
+            return {'CANCELLED'}
+
+        idx = char.prompt_schedule_index
+        item = char.prompt_schedule[idx]
+        orig_arm = bpy.data.objects.get(item.pose_armature_name)
+        if not orig_arm:
+            self.report({'ERROR'}, f"Pose constraint armature '{item.pose_armature_name}' not found.")
+            return {'CANCELLED'}
+
+        blend_path = os.path.join(os.path.dirname(__file__), "Ardy_Core_Rig.blend")
+        if not os.path.exists(blend_path):
+            self.report({'ERROR'}, f"Rig file not found: {blend_path}")
+            return {'CANCELLED'}
+
+        try:
+            with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+                if 'Ardy_Core_rig' in data_from.collections:
+                    data_to.collections = ['Ardy_Core_rig']
+
+            if not data_to.collections:
+                self.report({'ERROR'}, "Collection 'Ardy_Core_rig' not found in Ardy_Core_Rig.blend")
+                return {'CANCELLED'}
+
+            loaded_coll = data_to.collections[0]
+            context.scene.collection.children.link(loaded_coll)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to load IK rig collection: {e}")
+            return {'CANCELLED'}
+
+        rig_obj = None
+        arm_obj = None
+        for o in loaded_coll.all_objects:
+            if o.type == 'ARMATURE':
+                if "Ardy_Core_rig" in o.name:
+                    rig_obj = o
+                elif "Ardy_Armature" in o.name and o != orig_arm:
+                    arm_obj = o
+
+        if not rig_obj:
+            self.report({'ERROR'}, "Rig object 'Ardy_Core_rig' not found in loaded collection.")
+            return {'CANCELLED'}
+
+        if arm_obj:
+            arm_obj.matrix_world = orig_arm.matrix_world.copy()
+
+        # Align rig controls to orig_arm pose
+        align_rig_to_pose_armature(orig_arm, rig_obj)
+
+        # Hide original pose constraint armature
+        orig_arm.hide_set(True)
+
+        # Update properties
+        props.ik_control_active = True
+        props.ik_loaded_collection_name = loaded_coll.name
+        props.ik_original_armature_name = orig_arm.name
+
+        # Select rig object and switch to Pose Mode
+        if context.active_object and context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        bpy.ops.object.select_all(action='DESELECT')
+        rig_obj.select_set(True)
+        context.view_layer.objects.active = rig_obj
+        bpy.ops.object.mode_set(mode='POSE')
+
+        tag_redraw_view3d(context)
+        self.report({'INFO'}, f"IK Control active for '{orig_arm.name}'")
+        return {'FINISHED'}
+
+class CEB_OT_BakeIKPose(bpy.types.Operator):
+    bl_idname = "ceb.bake_ik_pose"
+    bl_label = "Bake Pose to Constraint"
+    bl_description = "Bake the pose from the IK rig back to the original pose constraint armature (no keyframes)"
+
+    @classmethod
+    def poll(cls, context):
+        if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+            return False
+        return context.scene.ceb_ardy.ik_control_active
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        orig_arm_name = props.ik_original_armature_name
+        orig_arm = bpy.data.objects.get(orig_arm_name)
+
+        coll_name = props.ik_loaded_collection_name
+        coll = bpy.data.collections.get(coll_name)
+
+        arm_obj = None
+        if coll:
+            for o in coll.all_objects:
+                if o.type == 'ARMATURE' and "Ardy_Armature" in o.name and o != orig_arm:
+                    arm_obj = o
+
+        if context.active_object and context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        if orig_arm and arm_obj:
+            copy_evaluated_pose_to_armature(arm_obj, orig_arm)
+
+        if orig_arm:
+            orig_arm.hide_set(False)
+            bpy.ops.object.select_all(action='DESELECT')
+            orig_arm.select_set(True)
+            context.view_layer.objects.active = orig_arm
+
+        cleanup_ik_control_collection(context)
+
+        props.ik_control_active = False
+        props.ik_loaded_collection_name = ""
+        props.ik_original_armature_name = ""
+
+        tag_redraw_view3d(context)
+        send_pose_constraints_to_bridge(context)
+        self.report({'INFO'}, "Baked pose to constraint successfully.")
+        return {'FINISHED'}
+
+class CEB_OT_CancelIKControl(bpy.types.Operator):
+    bl_idname = "ceb.cancel_ik_control"
+    bl_label = "Cancel IK Control"
+    bl_description = "Cancel IK control mode, erasing loaded IK rig and unhiding original armature"
+
+    @classmethod
+    def poll(cls, context):
+        if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+            return False
+        return context.scene.ceb_ardy.ik_control_active
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        orig_arm_name = props.ik_original_armature_name
+        orig_arm = bpy.data.objects.get(orig_arm_name)
+
+        if context.active_object and context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        if orig_arm:
+            orig_arm.hide_set(False)
+            bpy.ops.object.select_all(action='DESELECT')
+            orig_arm.select_set(True)
+            context.view_layer.objects.active = orig_arm
+
+        cleanup_ik_control_collection(context)
+
+        props.ik_control_active = False
+        props.ik_loaded_collection_name = ""
+        props.ik_original_armature_name = ""
+
+        tag_redraw_view3d(context)
+        self.report({'INFO'}, "IK Control cancelled.")
+        return {'FINISHED'}
+
 classes = (
     CEB_Ardy_PromptItem,
     CEB_Ardy_Character,
@@ -2977,6 +3373,9 @@ classes = (
     CEB_OT_ArdyStartBridge,
     CEB_OT_ArdyRealtimeStream,
     CEB_OT_RetargetMHR,
+    CEB_OT_StartIKControl,
+    CEB_OT_BakeIKPose,
+    CEB_OT_CancelIKControl,
 )
 
 def register():
