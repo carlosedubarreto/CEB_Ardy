@@ -60,7 +60,6 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
 
         # --- ARDY Path Settings ---
         box = layout.box()
-        box.enabled = not is_ik_active
         box.label(text="Path Settings", icon='FOLDER_REDIRECT')
         
         package_name = __package__ if __package__ else "CEB_Ardy"
@@ -86,7 +85,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             box.label(text="Addon preferences not registered.", icon='ERROR')
         # --- Standalone Viser Web App ---
         box_viser = layout.box()
-        box_viser.enabled = not is_ik_active
+        box_viser.enabled = is_path_set and (not is_ik_active)
         box_viser.label(text="Viser Web App", icon='URL')
         viser_row = box_viser.row(align=True)
         viser_row.scale_y = 1.1
@@ -99,10 +98,11 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
 
         # --- Character Selector ---
         box = layout.box()
-        box.enabled = not is_ik_active
+        box.enabled = is_path_set
         box.label(text="Character Selection", icon='OUTLINER_OB_ARMATURE')
         
         row = box.row()
+        row.enabled = not is_ik_active
         row.template_list(
             "CEB_UL_CharacterList", "",
             props, "characters",
@@ -110,20 +110,40 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             rows=2
         )
         col = row.column(align=True)
+        col.enabled = not is_ik_active
         col.operator("ceb.add_character_entry", text="", icon='ADD')
         col.operator("ceb.remove_character_entry", text="", icon='REMOVE')
 
         if char:
             char_box = box.box()
-            char_box.prop(char, "name", text="Name")
-            char_box.prop(char, "model", text="Model")
+            char_props_box = char_box.box()
+            char_props_box.enabled = not is_ik_active
+            char_props_box.prop(char, "name", text="Name")
+            char_props_box.prop(char, "model", text="Model")
+
+            # --- IK Control for Character ---
+            ik_char_box = char_box.box()
+            target_type = getattr(props, "ik_target_type", 'CONSTRAINT')
+            if is_ik_active and target_type == 'CHARACTER':
+                ik_char_box.alert = True
+                ik_char_box.label(text=f"IK Control Active ({props.ik_original_armature_name})", icon='CONSTRAINT_BONE')
+                ik_row = ik_char_box.row(align=True)
+                ik_row.scale_y = 1.3
+                ik_row.operator("ceb.bake_ik_pose", text="Bake Pose to Character", icon='CHECKMARK')
+                ik_row.operator("ceb.cancel_ik_control", text="Cancel IK", icon='CANCEL')
+            elif not is_ik_active:
+                ik_row = ik_char_box.row(align=True)
+                ik_row.scale_y = 1.2
+                op = ik_row.operator("ceb.start_ik_control", text="IK Control Character", icon='CONSTRAINT_BONE')
+                op.target_type = 'CHARACTER'
         else:
             char_box = box.box()
+            char_box.enabled = not is_ik_active
             char_box.label(text="Click '+' to add a character", icon='INFO')
 
         # --- Real-Time Control ---
         box = layout.box()
-        box.enabled = not is_ik_active
+        box.enabled = is_path_set and (not is_ik_active)
         box.label(text="Real-Time Control", icon='ORIENTATION_PARENT')
         
         is_connected = (props.realtime_status == "Connected")
@@ -142,7 +162,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         # Bridge Server Controls
         row = box.row(align=True)
         row.scale_y = 1.2
-        row.enabled = (is_path_set or is_connected) and (not is_ik_active)
+        row.enabled = is_path_set and (not is_ik_active)
         row.operator("ceb.ardy_start_bridge", text="Start Bridge", icon='PLAY')
 
         # Connect / Disconnect Stream Controls (Fixed position, depress highlight when connected)
@@ -151,7 +171,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             
         stream_row = box.row(align=True)
         stream_row.scale_y = 1.5
-        stream_row.enabled = (is_path_set or is_connected) and (not is_ik_active)
+        stream_row.enabled = is_path_set and (not is_ik_active)
         stream_row.operator("ceb.ardy_realtime_stream", text=stream_text, icon=stream_icon, depress=is_connected)
         
         # Show Live Prompt ONLY if stream is connected and prompt schedule list is empty
@@ -161,6 +181,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         # --- Prompt Schedule ---
         if char:
             box = layout.box()
+            box.enabled = is_path_set
             header = box.row(align=True)
             header.enabled = not is_ik_active
             header.label(text=f"Prompt Schedule ({char.name})", icon='TIME')
@@ -213,17 +234,18 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                         wp_box.label(text=f"Target Armature: {selected_item.pose_armature_name}", icon='POSE_HLT')
                         
                         ik_box = wp_box.box()
-                        if is_ik_active:
+                        if is_ik_active and target_type == 'CONSTRAINT':
                             ik_box.alert = True
                             ik_box.label(text=f"IK Control Active ({props.ik_original_armature_name})", icon='CONSTRAINT_BONE')
                             ik_row = ik_box.row(align=True)
                             ik_row.scale_y = 1.3
                             ik_row.operator("ceb.bake_ik_pose", text="Bake Pose to Constraint", icon='CHECKMARK')
                             ik_row.operator("ceb.cancel_ik_control", text="Cancel IK", icon='CANCEL')
-                        else:
+                        elif not is_ik_active:
                             ik_row = ik_box.row(align=True)
                             ik_row.scale_y = 1.2
-                            ik_row.operator("ceb.start_ik_control", text="IK Control", icon='CONSTRAINT_BONE')
+                            op = ik_row.operator("ceb.start_ik_control", text="IK Control", icon='CONSTRAINT_BONE')
+                            op.target_type = 'CONSTRAINT'
 
 
 classes = (

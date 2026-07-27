@@ -791,7 +791,21 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     )
     ik_original_armature_name: bpy.props.StringProperty(
         name="IK Original Armature Name",
-        description="Name of original pose constraint armature being edited",
+        description="Name of original pose constraint or character armature being edited",
+        default=""
+    )
+    ik_target_type: bpy.props.EnumProperty(
+        name="IK Target Type",
+        description="Target type being controlled by IK (Constraint or Character)",
+        items=[
+            ('CONSTRAINT', "Constraint", "Controlling a pose constraint armature"),
+            ('CHARACTER', "Character", "Controlling the main character armature"),
+        ],
+        default='CONSTRAINT'
+    )
+    ik_hidden_object_names: bpy.props.StringProperty(
+        name="IK Hidden Object Names",
+        description="Comma-separated names of objects hidden when starting IK control",
         default=""
     )
 
@@ -3003,8 +3017,8 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
 def copy_evaluated_pose_to_armature(src_arm, dst_arm):
     """
     Copy the evaluated pose from src_arm (which has constraints/IK)
-    to dst_arm (the pose constraint armature, without keyframes).
-    Uses exact topological matrix decomposition to achieve zero pose error.
+    to dst_arm (the pose constraint or character armature, without keyframes).
+    Preserves exact global world space position for root bones.
     """
     depsgraph = bpy.context.evaluated_depsgraph_get()
     depsgraph.update()
@@ -3020,6 +3034,8 @@ def copy_evaluated_pose_to_armature(src_arm, dst_arm):
     for b in dst_arm.data.bones:
         visit(b)
 
+    dst_inv = dst_arm.matrix_world.inverted()
+
     for b in ordered_bones:
         dst_pb = dst_arm.pose.bones[b.name]
         src_pb = src_eval.pose.bones.get(b.name)
@@ -3029,9 +3045,10 @@ def copy_evaluated_pose_to_armature(src_arm, dst_arm):
         dst_pb.rotation_mode = 'QUATERNION'
 
         if not b.parent:
-            rest_mat = b.matrix_local
-            pose_mat = src_pb.matrix
-            delta_mat = rest_mat.inverted() @ pose_mat
+            # Root bone: use world matrix of src_eval decomposed relative to dst_arm
+            src_wmat = src_eval.matrix_world @ src_pb.matrix
+            dst_pose_mat = dst_inv @ src_wmat
+            delta_mat = b.matrix_local.inverted() @ dst_pose_mat
             dst_pb.location = delta_mat.to_translation()
             dst_pb.rotation_quaternion = delta_mat.to_quaternion()
             dst_pb.scale = delta_mat.to_scale()
@@ -3046,9 +3063,18 @@ def copy_evaluated_pose_to_armature(src_arm, dst_arm):
 
 def align_rig_to_pose_armature(orig_arm, rig_obj):
     """Align loaded Ardy_Core_rig controls to match orig_arm pose in IK mode."""
-    # 1. Match rig object world matrix with R_180 facing adjustment
-    R_180 = mathutils.Matrix.Rotation(math.pi, 4, 'Z')
-    rig_obj.matrix_world = orig_arm.matrix_world @ R_180
+    # 1. Match rig object world matrix to ground position (Z=0) and heading Z-rotation directly under Hips
+    if 'Hips' in orig_arm.pose.bones:
+        hips_wmat = orig_arm.matrix_world @ orig_arm.pose.bones['Hips'].matrix
+        hips_wpos = hips_wmat.to_translation()
+        ground_pos = mathutils.Vector((hips_wpos.x, hips_wpos.y, 0.0))
+        char_rot_z = hips_wmat.to_euler().z
+    else:
+        hips_wpos = orig_arm.matrix_world.to_translation()
+        ground_pos = mathutils.Vector((hips_wpos.x, hips_wpos.y, 0.0))
+        char_rot_z = orig_arm.matrix_world.to_euler().z
+
+    rig_obj.matrix_world = mathutils.Matrix.Translation(ground_pos) @ mathutils.Matrix.Rotation(char_rot_z, 4, 'Z')
     rig_inv = rig_obj.matrix_world.inverted()
 
     # Controls mapping: (orig_arm bone, rig control bone, rig qr_offset bone)
@@ -3138,14 +3164,18 @@ def align_rig_to_pose_armature(orig_arm, rig_obj):
             if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
                 bpy.context.view_layer.update()
 
-    # Set pole targets for IK elbows (behind) and knees (in front) taking Child Of constraints into account
+    # Set pole targets for IK elbows (behind body) and knees (in front of body) with evaluated verification
     def set_pole(shoulder_name, elbow_name, hand_name, pole_name, is_leg=False):
         if all(b in orig_arm.pose.bones for b in (shoulder_name, elbow_name, hand_name)) and pole_name in rig_obj.pose.bones:
             p_sh = (orig_arm.matrix_world @ orig_arm.pose.bones[shoulder_name].matrix).to_translation()
             p_el = (orig_arm.matrix_world @ orig_arm.pose.bones[elbow_name].matrix).to_translation()
             p_hd = (orig_arm.matrix_world @ orig_arm.pose.bones[hand_name].matrix).to_translation()
             
-            char_fwd = (orig_arm.matrix_world.to_quaternion() @ mathutils.Vector((0, 1, 0))).normalized()
+            if 'c_root_master.x' in rig_obj.pose.bones:
+                root_master_wmat = rig_obj.matrix_world @ rig_obj.pose.bones['c_root_master.x'].matrix
+                char_fwd = (root_master_wmat.to_quaternion() @ mathutils.Vector((0, 1, 0))).normalized()
+            else:
+                char_fwd = (orig_arm.matrix_world.to_quaternion() @ mathutils.Vector((0, 1, 0))).normalized()
             
             v_sh_hd = (p_hd - p_sh)
             if v_sh_hd.length > 1e-4:
@@ -3166,19 +3196,33 @@ def align_rig_to_pose_armature(orig_arm, rig_obj):
                 if pole_dir.dot(char_fwd) > 0:
                     pole_dir = -pole_dir
                     
-            pole_pos = p_el + pole_dir * 0.5
-            
-            target_wmat = mathutils.Matrix.Translation(pole_pos)
-            pb = rig_obj.pose.bones[pole_name]
-            childof = next((c for c in pb.constraints if c.type == 'CHILD_OF' and c.influence > 0), None)
-            if childof and childof.subtarget in rig_obj.pose.bones:
-                sub_wmat = rig_obj.matrix_world @ rig_obj.pose.bones[childof.subtarget].matrix
-                child_wmat = sub_wmat @ childof.inverse_matrix
-                pb.matrix = child_wmat.inverted() @ target_wmat
-            else:
-                pb.matrix = rig_inv @ target_wmat
-            if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
-                bpy.context.view_layer.update()
+            def assign_pole_matrix(dir_vec):
+                pole_pos = p_el + dir_vec * 0.5
+                target_wmat = mathutils.Matrix.Translation(pole_pos)
+                pb = rig_obj.pose.bones[pole_name]
+                childof = next((c for c in pb.constraints if c.type == 'CHILD_OF' and c.influence > 0), None)
+                if childof and childof.subtarget in rig_obj.pose.bones:
+                    sub_wmat = rig_obj.matrix_world @ rig_obj.pose.bones[childof.subtarget].matrix
+                    child_wmat = sub_wmat @ childof.inverse_matrix
+                    pb.matrix = child_wmat.inverted() @ target_wmat
+                else:
+                    pb.matrix = rig_inv @ target_wmat
+                if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
+                    bpy.context.view_layer.update()
+
+            assign_pole_matrix(pole_dir)
+
+            # Verification of evaluated world position
+            if hasattr(bpy.context, "evaluated_depsgraph_get"):
+                dg = bpy.context.evaluated_depsgraph_get()
+                dg.update()
+                r_eval = rig_obj.evaluated_get(dg)
+                eval_wpos = (r_eval.matrix_world @ r_eval.pose.bones[pole_name].matrix).to_translation()
+                eval_dir = (eval_wpos - p_el).normalized()
+                if is_leg and eval_dir.dot(char_fwd) < 0:
+                    assign_pole_matrix(-pole_dir)
+                elif not is_leg and eval_dir.dot(char_fwd) > 0:
+                    assign_pole_matrix(-pole_dir)
 
     set_pole('RightArm', 'RightForeArm', 'RightHand', 'c_arms_pole.r', is_leg=False)
     set_pole('LeftArm', 'LeftForeArm', 'LeftHand', 'c_arms_pole.l', is_leg=False)
@@ -3207,7 +3251,16 @@ def cleanup_ik_control_collection(context):
 class CEB_OT_StartIKControl(bpy.types.Operator):
     bl_idname = "ceb.start_ik_control"
     bl_label = "IK Control"
-    bl_description = "Load IK Control rig to visually edit the selected pose constraint"
+    bl_description = "Load IK Control rig to visually edit pose for character or pose constraint"
+
+    target_type: bpy.props.EnumProperty(
+        name="Target Type",
+        items=[
+            ('CONSTRAINT', "Constraint", "Edit pose constraint"),
+            ('CHARACTER', "Character", "Edit character armature pose"),
+        ],
+        default='CONSTRAINT'
+    )
 
     @classmethod
     def poll(cls, context):
@@ -3217,42 +3270,60 @@ class CEB_OT_StartIKControl(bpy.types.Operator):
         if props.ik_control_active:
             return False
         char = get_active_character(context)
-        if not char or not char.prompt_schedule:
+        if not char:
             return False
-        idx = char.prompt_schedule_index
-        if 0 <= idx < len(char.prompt_schedule):
-            item = char.prompt_schedule[idx]
-            if getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
-                obj = bpy.data.objects.get(item.pose_armature_name)
-                return obj is not None
-        return False
+        return True
 
     def execute(self, context):
         props = context.scene.ceb_ardy
         char = get_active_character(context)
-        if not char or not char.prompt_schedule:
-            self.report({'ERROR'}, "No active character or schedule.")
+        if not char:
+            self.report({'ERROR'}, "No active character.")
             return {'CANCELLED'}
 
-        idx = char.prompt_schedule_index
-        item = char.prompt_schedule[idx]
-        orig_arm = bpy.data.objects.get(item.pose_armature_name)
-        if not orig_arm:
-            self.report({'ERROR'}, f"Pose constraint armature '{item.pose_armature_name}' not found.")
-            return {'CANCELLED'}
+        orig_arm = None
+        if self.target_type == 'CHARACTER':
+            clean_name = char.name.replace(" ", "_")
+            arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
+            orig_arm = bpy.data.objects.get(arm_name)
+            if not orig_arm:
+                orig_arm = bpy.data.objects.get("Character_1_Armature") or bpy.data.objects.get(f"{char.name}_Armature")
+            if not orig_arm:
+                self.report({'ERROR'}, f"Character armature object for '{char.name}' not found.")
+                return {'CANCELLED'}
+            blend_file_name = "Ardy_Core_Rig_Character.blend"
+            coll_to_load = "Andy_Core_Character_rig"
+        else:
+            if not char.prompt_schedule:
+                self.report({'ERROR'}, "No active schedule items.")
+                return {'CANCELLED'}
+            idx = char.prompt_schedule_index
+            if not (0 <= idx < len(char.prompt_schedule)):
+                self.report({'ERROR'}, "Invalid schedule item index.")
+                return {'CANCELLED'}
+            item = char.prompt_schedule[idx]
+            if not getattr(item, "has_pose_constraint", False) or not getattr(item, "pose_armature_name", ""):
+                self.report({'ERROR'}, "Selected schedule item is not a pose constraint.")
+                return {'CANCELLED'}
+            orig_arm = bpy.data.objects.get(item.pose_armature_name)
+            if not orig_arm:
+                self.report({'ERROR'}, f"Pose constraint armature '{item.pose_armature_name}' not found.")
+                return {'CANCELLED'}
+            blend_file_name = "Ardy_Core_Rig.blend"
+            coll_to_load = "Ardy_Core_rig"
 
-        blend_path = os.path.join(os.path.dirname(__file__), "Ardy_Core_Rig.blend")
+        blend_path = os.path.join(os.path.dirname(__file__), blend_file_name)
         if not os.path.exists(blend_path):
             self.report({'ERROR'}, f"Rig file not found: {blend_path}")
             return {'CANCELLED'}
 
         try:
             with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
-                if 'Ardy_Core_rig' in data_from.collections:
-                    data_to.collections = ['Ardy_Core_rig']
+                if coll_to_load in data_from.collections:
+                    data_to.collections = [coll_to_load]
 
             if not data_to.collections:
-                self.report({'ERROR'}, "Collection 'Ardy_Core_rig' not found in Ardy_Core_Rig.blend")
+                self.report({'ERROR'}, f"Collection '{coll_to_load}' not found in {blend_file_name}")
                 return {'CANCELLED'}
 
             loaded_coll = data_to.collections[0]
@@ -3265,28 +3336,60 @@ class CEB_OT_StartIKControl(bpy.types.Operator):
         arm_obj = None
         for o in loaded_coll.all_objects:
             if o.type == 'ARMATURE':
-                if "Ardy_Core_rig" in o.name:
+                if 'c_root.x' in o.pose.bones or o.name == 'rig' or 'Ardy_Core_rig' in o.name:
                     rig_obj = o
-                elif "Ardy_Armature" in o.name and o != orig_arm:
+                elif o != orig_arm:
                     arm_obj = o
 
         if not rig_obj:
-            self.report({'ERROR'}, "Rig object 'Ardy_Core_rig' not found in loaded collection.")
+            self.report({'ERROR'}, f"Rig object not found in loaded collection '{coll_to_load}'.")
             return {'CANCELLED'}
-
-        if arm_obj:
-            arm_obj.matrix_world = orig_arm.matrix_world.copy()
 
         # Align rig controls to orig_arm pose
         align_rig_to_pose_armature(orig_arm, rig_obj)
 
-        # Hide original pose constraint armature
-        orig_arm.hide_set(True)
+        if arm_obj:
+            arm_obj.matrix_world = rig_obj.matrix_world.copy()
+
+        # Collect objects to hide (original armature AND associated mesh/skin objects)
+        objects_to_hide = [orig_arm]
+        
+        # Add any direct children of orig_arm
+        for o in bpy.data.objects:
+            if o.parent == orig_arm:
+                objects_to_hide.append(o)
+                
+        # Add character mesh/skin and parent objects if target_type == 'CHARACTER'
+        if self.target_type == 'CHARACTER' and char:
+            clean_name = char.name.replace(" ", "_")
+            if char.mesh_obj_name:
+                mesh_o = bpy.data.objects.get(char.mesh_obj_name)
+                if mesh_o:
+                    objects_to_hide.append(mesh_o)
+            if char.parent_obj_name:
+                parent_o = bpy.data.objects.get(char.parent_obj_name)
+                if parent_o:
+                    objects_to_hide.append(parent_o)
+                    for o in bpy.data.objects:
+                        if o.parent == parent_o:
+                            objects_to_hide.append(o)
+            for o in bpy.data.objects:
+                if o.name.startswith(f"{clean_name}_Skin") or o.name.startswith(f"{clean_name}_Mesh") or o.name.startswith(f"{clean_name}_Geo"):
+                    objects_to_hide.append(o)
+
+        hidden_names = []
+        for obj in objects_to_hide:
+            if obj and not obj.hide_get():
+                obj.hide_set(True)
+                if obj.name not in hidden_names:
+                    hidden_names.append(obj.name)
 
         # Update properties
         props.ik_control_active = True
+        props.ik_target_type = self.target_type
         props.ik_loaded_collection_name = loaded_coll.name
         props.ik_original_armature_name = orig_arm.name
+        props.ik_hidden_object_names = ",".join(hidden_names)
 
         # Select rig object and switch to Pose Mode
         if context.active_object and context.active_object.mode != 'OBJECT':
@@ -3298,13 +3401,14 @@ class CEB_OT_StartIKControl(bpy.types.Operator):
         bpy.ops.object.mode_set(mode='POSE')
 
         tag_redraw_view3d(context)
-        self.report({'INFO'}, f"IK Control active for '{orig_arm.name}'")
+        target_label = "Character" if self.target_type == 'CHARACTER' else "Constraint"
+        self.report({'INFO'}, f"IK Control active for {target_label} '{orig_arm.name}'")
         return {'FINISHED'}
 
 class CEB_OT_BakeIKPose(bpy.types.Operator):
     bl_idname = "ceb.bake_ik_pose"
     bl_label = "Bake Pose to Constraint"
-    bl_description = "Bake the pose from the IK rig back to the original pose constraint armature (no keyframes)"
+    bl_description = "Bake the pose from the IK rig back to the original armature (no keyframes)"
 
     @classmethod
     def poll(cls, context):
@@ -3320,11 +3424,15 @@ class CEB_OT_BakeIKPose(bpy.types.Operator):
         coll_name = props.ik_loaded_collection_name
         coll = bpy.data.collections.get(coll_name)
 
+        rig_obj = None
         arm_obj = None
         if coll:
             for o in coll.all_objects:
-                if o.type == 'ARMATURE' and "Ardy_Armature" in o.name and o != orig_arm:
-                    arm_obj = o
+                if o.type == 'ARMATURE':
+                    if 'c_root.x' in o.pose.bones or o.name == 'rig' or 'Ardy_Core_rig' in o.name:
+                        rig_obj = o
+                    elif o != orig_arm:
+                        arm_obj = o
 
         if context.active_object and context.active_object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -3332,21 +3440,38 @@ class CEB_OT_BakeIKPose(bpy.types.Operator):
         if orig_arm and arm_obj:
             copy_evaluated_pose_to_armature(arm_obj, orig_arm)
 
+        # Unhide original armature AND associated mesh/skin objects
         if orig_arm:
             orig_arm.hide_set(False)
+
+        if props.ik_hidden_object_names:
+            for name in props.ik_hidden_object_names.split(","):
+                name = name.strip()
+                if name:
+                    o = bpy.data.objects.get(name)
+                    if o:
+                        o.hide_set(False)
+
+        if orig_arm:
             bpy.ops.object.select_all(action='DESELECT')
             orig_arm.select_set(True)
             context.view_layer.objects.active = orig_arm
 
+        is_constraint = (getattr(props, "ik_target_type", 'CONSTRAINT') == 'CONSTRAINT')
         cleanup_ik_control_collection(context)
 
         props.ik_control_active = False
+        props.ik_target_type = 'CONSTRAINT'
         props.ik_loaded_collection_name = ""
         props.ik_original_armature_name = ""
+        props.ik_hidden_object_names = ""
 
         tag_redraw_view3d(context)
-        send_pose_constraints_to_bridge(context)
-        self.report({'INFO'}, "Baked pose to constraint successfully.")
+        if is_constraint:
+            send_pose_constraints_to_bridge(context)
+            self.report({'INFO'}, "Baked pose to constraint successfully.")
+        else:
+            self.report({'INFO'}, "Baked pose to character armature successfully.")
         return {'FINISHED'}
 
 class CEB_OT_CancelIKControl(bpy.types.Operator):
@@ -3368,8 +3493,19 @@ class CEB_OT_CancelIKControl(bpy.types.Operator):
         if context.active_object and context.active_object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
+        # Unhide original armature AND associated mesh/skin objects
         if orig_arm:
             orig_arm.hide_set(False)
+
+        if props.ik_hidden_object_names:
+            for name in props.ik_hidden_object_names.split(","):
+                name = name.strip()
+                if name:
+                    o = bpy.data.objects.get(name)
+                    if o:
+                        o.hide_set(False)
+
+        if orig_arm:
             bpy.ops.object.select_all(action='DESELECT')
             orig_arm.select_set(True)
             context.view_layer.objects.active = orig_arm
@@ -3377,8 +3513,10 @@ class CEB_OT_CancelIKControl(bpy.types.Operator):
         cleanup_ik_control_collection(context)
 
         props.ik_control_active = False
+        props.ik_target_type = 'CONSTRAINT'
         props.ik_loaded_collection_name = ""
         props.ik_original_armature_name = ""
+        props.ik_hidden_object_names = ""
 
         tag_redraw_view3d(context)
         self.report({'INFO'}, "IK Control cancelled.")

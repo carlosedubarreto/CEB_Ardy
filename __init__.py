@@ -25,7 +25,8 @@ bl_info = {
 
 ### wip5
 ### OK - update para blender 5.2 
-### - Temp Ik to control the pose easily
+### OK - Temp Ik to control the pose easily
+### OK - consertar ik control para o character quando em esta em posição diferente da padrao, emuma curva, por exemplo
 
 ### - keyboard based velocity
 ### - Kinematic constraints 
