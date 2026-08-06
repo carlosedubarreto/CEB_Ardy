@@ -808,6 +808,26 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         description="Comma-separated names of objects hidden when starting IK control",
         default=""
     )
+    crowd_count: bpy.props.IntProperty(
+        name="Crowd Count",
+        description="Number of characters in the crowd",
+        default=10,
+        min=1,
+        max=500
+    )
+    crowd_start_frame: bpy.props.IntProperty(
+        name="Start Frame",
+        description="Start frame for crowd animation",
+        default=1,
+        min=0
+    )
+    crowd_end_frame: bpy.props.IntProperty(
+        name="End Frame",
+        description="End frame for crowd animation",
+        default=250,
+        min=1
+    )
+
 
 class CEB_OT_AddCharacterEntry(bpy.types.Operator):
     bl_idname = "ceb.add_character_entry"
@@ -2740,7 +2760,135 @@ class CEB_OT_RetargetMHR(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def copy_character_prompt_schedule(source_char, target_char, context):
+    if source_char == target_char:
+        return
+    for item in list(target_char.prompt_schedule):
+        remove_waypoint_empty(item)
+        remove_pose_constraint_armature(item)
+    target_char.prompt_schedule.clear()
+
+    target_char.realtime_prompt = source_char.realtime_prompt
+
+    for src_item in source_char.prompt_schedule:
+        new_item = target_char.prompt_schedule.add()
+        new_item.prompt = src_item.prompt
+        new_item.start_frame = src_item.start_frame
+        new_item.enabled = src_item.enabled
+        new_item.has_waypoint = src_item.has_waypoint
+        if src_item.has_waypoint:
+            new_item.waypoint_co = src_item.waypoint_co
+            get_or_create_waypoint_empty(context, new_item)
+        new_item.has_pose_constraint = src_item.has_pose_constraint
+        if src_item.has_pose_constraint:
+            get_or_create_pose_constraint_armature(context, new_item, copy_current_pose=True)
+
+
+class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
+    bl_idname = "ceb.generate_crowd_animation"
+    bl_label = "Generate Crowd Animation"
+    bl_description = "Generate crowd characters and produce animations for all of them automatically using active character's prompts"
+
+    def execute(self, context):
+        paths, err = get_ardy_paths(context)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+
+        props = context.scene.ceb_ardy
+        source_char = get_active_character(context)
+        if not source_char:
+            self.report({'ERROR'}, "No active character found in character list.")
+            return {'CANCELLED'}
+
+        target_count = props.crowd_count
+        start_frame = props.crowd_start_frame
+        end_frame = props.crowd_end_frame
+
+        if start_frame >= end_frame:
+            self.report({'ERROR'}, "Start frame must be less than end frame.")
+            return {'CANCELLED'}
+
+        # 1. Set scene start and end frames
+        context.scene.frame_start = start_frame
+        context.scene.frame_end = end_frame
+        context.scene.frame_current = start_frame
+
+        # 2. Ensure target_count characters exist in props.characters
+        current_count = len(props.characters)
+        if current_count < target_count:
+            for idx in range(current_count + 1, target_count + 1):
+                name = f"Character_{idx}"
+                while any(c.name == name for c in props.characters):
+                    idx += 1
+                    name = f"Character_{idx}"
+                c = props.characters.add()
+                c.name = name
+                c.model = 'core'
+
+        # 3. Calculate spatial grid layout for crowd positioning
+        num_chars = min(target_count, len(props.characters))
+        cols = math.ceil(math.sqrt(num_chars))
+        spacing = 2.0  # 2 meters between characters
+
+        for i in range(num_chars):
+            row_idx = i // cols
+            col_idx = i % cols
+            x = (col_idx - (cols - 1) / 2.0) * spacing
+            y = (row_idx - (math.ceil(num_chars / cols) - 1) / 2.0) * spacing
+            z = 0.0
+
+            # Set active character temporarily to perform character loading and prompt schedule copy
+            props.active_character_index = i
+            char = props.characters[i]
+
+            clean_prefix = char.name.replace(" ", "_")
+            arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+            arm_obj = bpy.data.objects.get(arm_name)
+
+            if not arm_obj:
+                bpy.ops.ceb.load_character()
+                arm_obj = bpy.data.objects.get(char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature")
+
+            if arm_obj:
+                arm_obj.location = mathutils.Vector((x, y, z))
+
+            if i != 0 and char != source_char:
+                copy_character_prompt_schedule(source_char, char, context)
+
+        # 4. Reset active character to 0 to begin sequential stream generation
+        props.active_character_index = 0
+        tag_redraw_view3d(context)
+
+        # 5. Start real-time stream in crowd generation mode
+        global _realtime_running
+        if _realtime_running:
+            bpy.ops.ceb.ardy_realtime_stream()
+
+        CEB_OT_ArdyRealtimeStream._is_crowd_generating = True
+        CEB_OT_ArdyRealtimeStream._crowd_char_indices = list(range(num_chars))
+        CEB_OT_ArdyRealtimeStream._crowd_current_char_idx = 0
+        CEB_OT_ArdyRealtimeStream._crowd_start_frame = start_frame
+        CEB_OT_ArdyRealtimeStream._crowd_end_frame = end_frame
+
+        try:
+            res = bpy.ops.ceb.ardy_realtime_stream()
+            if res in ({'FINISHED'}, {'RUNNING_MODAL'}):
+                self.report({'INFO'}, f"Crowd generation started for {num_chars} characters (Frames {start_frame}..{end_frame})...")
+                return {'FINISHED'}
+            else:
+                CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
+                self.report({'ERROR'}, "Failed to start ARDY stream for crowd generation. Ensure Bridge process is running.")
+                return {'CANCELLED'}
+        except Exception as e:
+            CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
+            self.report({'ERROR'}, "Could not connect to ARDY real-time bridge. Please click 'Start Bridge' first.")
+            return {'CANCELLED'}
+
+
+
 class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
+
     bl_idname = "ceb.ardy_realtime_stream"
     bl_label = "Toggle Real-time Stream"
     bl_description = "Connect or disconnect the real-time ARDY motion stream"
@@ -2749,8 +2897,14 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
     _buffer = ""
     _frame_queue = None
     _prepared_arm_name = None
+    _is_crowd_generating = False
+    _crowd_char_indices = []
+    _crowd_current_char_idx = 0
+    _crowd_start_frame = 1
+    _crowd_end_frame = 250
 
     def modal(self, context, event):
+
         global _realtime_client, _realtime_running
 
         if event.type == 'TIMER':
@@ -2841,9 +2995,20 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             _active_stream_operator = self
             props.realtime_status = "Connected"
             
+            self._is_crowd_generating = getattr(CEB_OT_ArdyRealtimeStream, "_is_crowd_generating", False)
+            self._crowd_char_indices = getattr(CEB_OT_ArdyRealtimeStream, "_crowd_char_indices", [])
+            self._crowd_current_char_idx = getattr(CEB_OT_ArdyRealtimeStream, "_crowd_current_char_idx", 0)
+            self._crowd_start_frame = getattr(CEB_OT_ArdyRealtimeStream, "_crowd_start_frame", 1)
+            self._crowd_end_frame = getattr(CEB_OT_ArdyRealtimeStream, "_crowd_end_frame", 250)
+
+            CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
+            CEB_OT_ArdyRealtimeStream._crowd_char_indices = []
+            CEB_OT_ArdyRealtimeStream._crowd_current_char_idx = 0
+
             self._buffer = ""
             self._frame_queue = []
             self._reset_pending = True
+
             
             current_frame = context.scene.frame_current
             self._start_frame = current_frame
@@ -2910,6 +3075,9 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         self._buffer = ""
         self._frame_queue = None
         self._prepared_arm_name = None
+        self._is_crowd_generating = False
+        self._crowd_char_indices = []
+        self._crowd_current_char_idx = 0
         _realtime_running = False
         _active_stream_operator = None
         props.realtime_status = "Disconnected"
@@ -3013,6 +3181,52 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
 
         if props.realtime_recording:
             context.scene.frame_current += 1
+
+        # Check multi-character crowd generation auto-advance
+        if getattr(self, "_is_crowd_generating", False):
+            end_f = getattr(self, "_crowd_end_frame", 250)
+            if frame_num >= end_f:
+                if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action:
+                    act = arm_obj.animation_data.action
+                    if action_has_curves(act):
+                        push_action_to_nla_track(arm_obj, act)
+                    arm_obj.animation_data.action = None
+
+                self._crowd_current_char_idx += 1
+                if self._crowd_current_char_idx < len(self._crowd_char_indices):
+                    next_idx = self._crowd_char_indices[self._crowd_current_char_idx]
+                    props.active_character_index = next_idx
+                    next_char = props.characters[next_idx]
+
+                    context.scene.frame_current = self._crowd_start_frame
+                    self._start_frame = self._crowd_start_frame
+
+                    clean_p = next_char.name.replace(" ", "_")
+                    next_arm_name = next_char.arm_obj_name if next_char.arm_obj_name else f"{clean_p}_Armature"
+                    next_arm_obj = bpy.data.objects.get(next_arm_name)
+                    if next_arm_obj:
+                        prepare_armature_for_streaming(next_arm_obj, next_char, context=context)
+                        self._prepared_arm_name = next_arm_obj.name
+                    else:
+                        self._prepared_arm_name = None
+
+                    self._frame_queue = []
+                    self._buffer = ""
+                    self._reset_pending = True
+
+                    active_prompt = get_active_prompt_for_frame(props, self._crowd_start_frame, context=context)
+                    self._last_sent_prompt = active_prompt
+
+                    send_switch_char_cmd(next_char, active_prompt, self._crowd_start_frame, context=context)
+                    print(f"[CEB Ardy Crowd] Switched to character {self._crowd_current_char_idx + 1}/{len(self._crowd_char_indices)} ('{next_char.name}')")
+                else:
+                    print("[CEB Ardy Crowd] All crowd characters generated successfully!")
+                    self._is_crowd_generating = False
+                    props.active_character_index = 0
+                    context.scene.frame_current = self._crowd_start_frame
+                    self.cleanup(context)
+                    self.report({'INFO'}, f"Crowd animation complete for {len(self._crowd_char_indices)} characters!")
+
 
 def copy_evaluated_pose_to_armature(src_arm, dst_arm):
     """
@@ -3547,7 +3761,9 @@ classes = (
     CEB_OT_CleanAnimation,
     CEB_OT_ArdyStartBridge,
     CEB_OT_ArdyRealtimeStream,
+    CEB_OT_GenerateCrowdAnimation,
     CEB_OT_RetargetMHR,
+
     CEB_OT_StartIKControl,
     CEB_OT_BakeIKPose,
     CEB_OT_CancelIKControl,

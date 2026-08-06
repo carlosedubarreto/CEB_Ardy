@@ -136,6 +136,20 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                 ik_row.scale_y = 1.2
                 op = ik_row.operator("ceb.start_ik_control", text="IK Control Character", icon='CONSTRAINT_BONE')
                 op.target_type = 'CHARACTER'
+
+            # --- Crowd Generation ---
+            crowd_box = char_box.box()
+            crowd_box.enabled = not is_ik_active
+            crowd_box.label(text="Crowd Generation", icon='COMMUNITY')
+            crowd_col = crowd_box.column(align=True)
+            crowd_col.prop(props, "crowd_count", text="Characters Count")
+            frame_row = crowd_col.row(align=True)
+            frame_row.prop(props, "crowd_start_frame", text="Start Frame")
+            frame_row.prop(props, "crowd_end_frame", text="End Frame")
+            btn_row = crowd_box.row(align=True)
+            btn_row.scale_y = 1.3
+            btn_row.operator("ceb.generate_crowd_animation", text="Generate Crowd Animation", icon='GROUP')
+
         else:
             char_box = box.box()
             char_box.enabled = not is_ik_active
