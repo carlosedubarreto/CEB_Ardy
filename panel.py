@@ -243,12 +243,12 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                         if active_crowd.empty_object_name:
                             c_details.label(text=f"Parent Empty: {active_crowd.empty_object_name}", icon='EMPTY_DATA')
 
-                        c_details.prop(active_crowd, "clear_settings_before_generate", text="Clear Settings Before Generate")
+                        # c_details.prop(active_crowd, "clear_settings_before_generate", text="Clear Settings Before Generate")
 
                         c_btns = c_details.row(align=True)
                         c_btns.scale_y = 1.2
                         c_btns.operator("ceb.select_crowd", text="Select", icon='RESTRICT_SELECT_OFF')
-                        c_btns.operator("ceb.regenerate_crowd", text="Regenerate", icon='FILE_REFRESH')
+                        # c_btns.operator("ceb.regenerate_crowd", text="Regenerate", icon='FILE_REFRESH')
                         c_btns.operator("ceb.clear_crowd_settings", text="Clear Settings", icon='TRASH')
                         c_btns.operator("ceb.delete_crowd", text="Delete", icon='TRASH')
 

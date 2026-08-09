@@ -41,9 +41,9 @@ bl_info = {
 
 ## V1.01 Wip2
 ## OK - Adicionar opção para que personagens nao atravessem outros.
-## - Criar list com os crowds
-## - Opção para regerar, recriando reganrando as opções ativas par ao crowd ou ignorando a geração dos avoid
-## - Gerenciamento dos crows, e opçao de esconder
+## OK - Criar list com os crowds
+## COMENTEI, estava gerando problema - Opção para regerar, recriando reganrando as opções ativas par ao crowd ou ignorando a geração dos avoid
+## OK - Gerenciamento dos crows, e opçao de esconder
 ## - 
 
 
