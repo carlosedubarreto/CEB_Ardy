@@ -46,7 +46,8 @@ bl_info = {
 ## OK - Gerenciamento dos crows, e opçao de esconder
 ## - 
 
-
+## V1.01 Wip2.1
+## - consertar problem com grnad equantidade de personagens (erro quando testo com 25)
 
 import bpy
 from bpy.props import StringProperty

@@ -1937,6 +1937,33 @@ def get_skin_path(paths, J):
     return candidate_paths[0]
 
 def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None, skin_path=None):
+    clean_prefix = char_name.replace(" ", "_") if char_name else ("Core" if J == 27 else "SOMA")
+
+    # Fast template duplication path for crowds / multi-character loads
+    template_arm_name = f"ARDY_Template_{J}_Armature"
+    template_mesh_name = f"ARDY_Template_{J}_Skin"
+
+    tmpl_arm = bpy.data.objects.get(template_arm_name)
+    tmpl_mesh = bpy.data.objects.get(template_mesh_name)
+
+    if tmpl_arm and tmpl_mesh:
+        arm_data = tmpl_arm.data.copy()
+        arm_obj = bpy.data.objects.new(f"{clean_prefix}_Armature", arm_data)
+        context.scene.collection.objects.link(arm_obj)
+        if parent_obj:
+            arm_obj.parent = parent_obj
+
+        mesh_data = tmpl_mesh.data.copy()
+        mesh_obj = bpy.data.objects.new(f"{clean_prefix}_Skin", mesh_data)
+        context.scene.collection.objects.link(mesh_obj)
+        mesh_obj.parent = arm_obj
+
+        arm_mod = mesh_obj.modifiers.new(name=f"{clean_prefix}_Armature_Mod", type='ARMATURE')
+        arm_mod.object = arm_obj
+
+        rig_joint_names = [b.name for b in arm_obj.data.bones]
+        return arm_obj, rig_joint_names
+
     try:
         import numpy as np
     except ImportError:
@@ -1965,8 +1992,6 @@ def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None, skin_p
     
     if parent_obj:
         parent_obj.rotation_euler = (0, 0, 0)
-
-    clean_prefix = char_name.replace(" ", "_") if char_name else ("Core" if J == 27 else "SOMA")
 
     # 1. Create Mesh
     mesh_data = bpy.data.meshes.new(name=f"{clean_prefix}_Skin_Mesh")
@@ -2043,20 +2068,36 @@ def setup_soma_skin(context, parent_obj, J, scale, paths, char_name=None, skin_p
     if original_active and original_active.name in context.view_layer.objects:
         context.view_layer.objects.active = original_active
     
-    # 4. Skin the Mesh (vertex weights for all W weight slots)
+    # 4. Skin the Mesh using batched vertex group assignments
     for name in rig_joint_names:
         mesh_obj.vertex_groups.new(name=name)
         
+    from collections import defaultdict
+    joint_weight_groups = defaultdict(list)
+
     num_weights = lbs_indices.shape[1]
     for v_idx in range(len(bind_vertices)):
         for i in range(num_weights):
-            joint_idx = lbs_indices[v_idx, i]
-            weight = lbs_weights[v_idx, i]
-            if weight > 0.0001:
-                joint_name = rig_joint_names[joint_idx]
-                v_group = mesh_obj.vertex_groups[joint_name]
-                v_group.add([v_idx], float(weight), 'REPLACE')
-                
+            w = float(lbs_weights[v_idx, i])
+            if w > 0.0001:
+                j_idx = lbs_indices[v_idx, i]
+                joint_name = rig_joint_names[j_idx]
+                w_rounded = round(w, 4)
+                joint_weight_groups[(joint_name, w_rounded)].append(v_idx)
+
+    for (joint_name, w_val), v_indices in joint_weight_groups.items():
+        v_group = mesh_obj.vertex_groups[joint_name]
+        v_group.add(v_indices, w_val, 'REPLACE')
+
+    # Save template object copies in data blocks for instant future character duplication
+    try:
+        tmpl_arm_data = arm_obj.data.copy()
+        tmpl_arm = bpy.data.objects.new(template_arm_name, tmpl_arm_data)
+        tmpl_mesh_data = mesh_obj.data.copy()
+        tmpl_mesh = bpy.data.objects.new(template_mesh_name, tmpl_mesh_data)
+    except Exception as e:
+        print(f"[CEB Ardy] Could not create template copy: {e}")
+
     return arm_obj, rig_joint_names
 
 
@@ -2064,43 +2105,33 @@ def apply_relaxed_idle_pose(arm_obj):
     """
     Apply a natural relaxed idle pose to an ARDY armature after loading.
     Rotates the upper arms down from the default T-pose to a comfortable
-    at-the-sides position, matching what the ARDY viser web app displays
-    as the initial idle/neutral state.
-
-    The cskel27 arm bones are oriented with local Y along the bone chain
-    and local X pointing "up" in the bind pose, so rotating around local X
-    swings the arms downward (positive X = down for RightArm, negative X for LeftArm).
-
-    Only affects pose bones – does not create any keyframes.
+    at-the-sides position. Sets both rotation_euler and rotation_quaternion
+    so Blender viewport renders the relaxed pose regardless of rotation mode.
     """
     import math
 
-    # Maps: bone_name -> (axis, angle_degrees) in LOCAL bone space.
-    # Y runs along the bone; X is perpendicular and controls up/down swing.
-    # Positive X on RightArm swings it downward; negative X on LeftArm swings it downward.
-    RELAXED_ROTATIONS = {
-        # Right arm chain
-        # "RightShoulder":  ('X',  10.0),   # slight downward roll at shoulder
-        "RightArm":       ('X',  -80.0),   # swing upper arm down alongside body
-        # "RightForeArm":   ('Z',   5.0),   # subtle elbow bend outward
-        # Left arm chain (local X is mirrored, so positive = down here too)
-        # "LeftShoulder":   ('X',  10.0),   # slight downward roll at shoulder
-        "LeftArm":        ('X',  -80.0),   # swing upper arm down alongside body
-        # "LeftForeArm":    ('Z',  -5.0),   # subtle elbow bend outward
-    }
-
-    if arm_obj is None or arm_obj.type != 'ARMATURE':
+    if not arm_obj or getattr(arm_obj, "type", "") != 'ARMATURE' or not getattr(arm_obj, "pose", None) or not hasattr(arm_obj.pose, "bones"):
         return
 
-    for bone_name, (axis, angle_deg) in RELAXED_ROTATIONS.items():
+    # (-80.0, 0.0, 0.0) on local X swings upper arms down from T-pose alongside body
+    RELAXED_ROTATIONS = {
+        "RightArm": (-80.0, 0.0, 0.0),   # swing right arm down alongside body
+        "LeftArm":  (-80.0, 0.0, 0.0),   # swing left arm down alongside body
+    }
+
+    for bone_name, (rx, ry, rz) in RELAXED_ROTATIONS.items():
         pbone = arm_obj.pose.bones.get(bone_name)
         if pbone is None:
             continue
+        euler = mathutils.Euler((math.radians(rx), math.radians(ry), math.radians(rz)), 'XYZ')
         pbone.rotation_mode = 'XYZ'
-        angle_rad = math.radians(angle_deg)
-        rot = [0.0, 0.0, 0.0]
-        rot["XYZ".index(axis)] = angle_rad
-        pbone.rotation_euler = mathutils.Euler(rot, 'XYZ')
+        pbone.rotation_euler = euler
+        pbone.rotation_quaternion = euler.to_quaternion()
+
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
 
 
 
@@ -2602,6 +2633,27 @@ class CEB_OT_LoadCharacter(bpy.types.Operator):
         char.mesh_obj_name = f"{clean_prefix}_Skin"
         char.parent_obj_name = ""
 
+        # Activate the armature so Blender's depsgraph is evaluated, then apply relaxed idle pose.
+        # Using a deferred timer guarantees the operator has fully exited and the scene is stable.
+        arm_name_deferred = arm_obj.name
+        def _apply_idle_pose():
+            obj = bpy.data.objects.get(arm_name_deferred)
+            if obj:
+                try:
+                    bpy.ops.object.select_all(action='DESELECT')
+                    obj.select_set(True)
+                    bpy.context.view_layer.objects.active = obj
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
+                apply_relaxed_idle_pose(obj)
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
+            return None  # Don't repeat
+        bpy.app.timers.register(_apply_idle_pose, first_interval=0.05)
+
         self.report({'INFO'}, f"Character loaded: {arm_obj.name} ({J} joints, scale={scale})")
         return {'FINISHED'}
 
@@ -2642,6 +2694,18 @@ class CEB_OT_LoadArdyCore(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')
         arm_obj.select_set(True)
         context.view_layer.objects.active = arm_obj
+
+        arm_name_deferred = arm_obj.name
+        def _apply_idle_pose_core():
+            obj = bpy.data.objects.get(arm_name_deferred)
+            if obj:
+                apply_relaxed_idle_pose(obj)
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
+            return None
+        bpy.app.timers.register(_apply_idle_pose_core, first_interval=0.05)
 
         self.report({'INFO'}, f"Ardy Core Body Armature Loaded Successfully: {arm_obj.name}")
         return {'FINISHED'}
@@ -3060,32 +3124,36 @@ class CEB_OT_RetargetMHR(bpy.types.Operator):
 
 
 def copy_character_prompt_schedule(source_char, target_char, context, offset_vec=(0.0, 0.0, 0.0), offset_waypoints=True):
-    if source_char == target_char:
+    if not source_char or not target_char or source_char == target_char:
         return
     for item in list(target_char.prompt_schedule):
         remove_waypoint_empty(item)
         remove_pose_constraint_armature(item)
     target_char.prompt_schedule.clear()
 
-    target_char.realtime_prompt = source_char.realtime_prompt
+    target_char.realtime_prompt = str(source_char.realtime_prompt)
 
-    for src_item in source_char.prompt_schedule:
+    for src_item in list(source_char.prompt_schedule):
         new_item = target_char.prompt_schedule.add()
-        new_item.prompt = src_item.prompt
-        new_item.start_frame = src_item.start_frame
-        new_item.enabled = src_item.enabled
-        new_item.has_waypoint = src_item.has_waypoint
-        if src_item.has_waypoint:
+        new_item.prompt = str(src_item.prompt)
+        new_item.start_frame = int(src_item.start_frame)
+        new_item.enabled = bool(src_item.enabled)
+        new_item.has_waypoint = bool(src_item.has_waypoint)
+        if new_item.has_waypoint:
             if offset_waypoints and offset_vec:
                 new_item.waypoint_co = (
-                    src_item.waypoint_co[0] + offset_vec[0],
-                    src_item.waypoint_co[1] + offset_vec[1],
-                    src_item.waypoint_co[2] + offset_vec[2]
+                    float(src_item.waypoint_co[0] + offset_vec[0]),
+                    float(src_item.waypoint_co[1] + offset_vec[1]),
+                    float(src_item.waypoint_co[2] + offset_vec[2])
                 )
             else:
-                new_item.waypoint_co = src_item.waypoint_co
+                new_item.waypoint_co = (
+                    float(src_item.waypoint_co[0]),
+                    float(src_item.waypoint_co[1]),
+                    float(src_item.waypoint_co[2])
+                )
             get_or_create_waypoint_empty(context, new_item)
-        new_item.has_pose_constraint = src_item.has_pose_constraint
+        new_item.has_pose_constraint = bool(src_item.has_pose_constraint)
 
     crowd = get_crowd_for_character(target_char.name, context)
     if crowd and crowd.empty_object_name:
@@ -3393,35 +3461,35 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
         if self.is_regenerating and active_crowd and active_crowd.clear_settings_before_generate:
             bpy.ops.ceb.clear_crowd_settings()
 
-        # Collect characters dedicated to this crowd
-        crowd_chars = []
+        source_char_name = source_char.name
+
+        # Collect character names dedicated to this crowd
+        crowd_char_names = []
 
         if self.is_regenerating and active_crowd:
             # Re-use existing characters assigned to this crowd
             c_names = [n.strip() for n in active_crowd.character_names.split(",") if n.strip()]
             for name in c_names:
-                for c in props.characters:
-                    if c.name == name:
-                        crowd_chars.append(c)
-                        break
+                if any(c.name == name for c in props.characters):
+                    crowd_char_names.append(name)
 
-        if not crowd_chars:
+        if not crowd_char_names:
             target_count = props.crowd_count
 
             # 1. Include source_char if it is not assigned to any existing crowd
             if source_char and not get_crowd_for_character(source_char.name, context):
-                crowd_chars.append(source_char)
+                crowd_char_names.append(source_char.name)
 
             # 2. Re-use any existing unassigned characters in props.characters
             for c in props.characters:
-                if len(crowd_chars) >= target_count:
+                if len(crowd_char_names) >= target_count:
                     break
-                if c not in crowd_chars and not get_crowd_for_character(c.name, context):
-                    crowd_chars.append(c)
+                if c.name not in crowd_char_names and not get_crowd_for_character(c.name, context):
+                    crowd_char_names.append(c.name)
 
             # 3. Create brand new characters for the remaining needed count
             idx_counter = len(props.characters) + 1
-            while len(crowd_chars) < target_count:
+            while len(crowd_char_names) < target_count:
                 name = f"Char_{idx_counter}"
                 while any(c.name == name for c in props.characters):
                     idx_counter += 1
@@ -3429,10 +3497,10 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
                 c = props.characters.add()
                 c.name = name
                 c.model = 'core'
-                crowd_chars.append(c)
+                crowd_char_names.append(c.name)
                 idx_counter += 1
 
-        num_chars = len(crowd_chars)
+        num_chars = len(crowd_char_names)
 
         # Calculate spatial positions and headings based on selected layout pattern
         positions = []
@@ -3489,12 +3557,19 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
         # Base reference position for Character 0
         x0, y0, z0 = positions[0]
 
-        for i, char in enumerate(crowd_chars):
+        # Re-fetch fresh source_char reference after collection modifications
+        source_char_obj = next((c for c in props.characters if c.name == source_char_name), None)
+
+        for i, char_name in enumerate(crowd_char_names):
             x, y, z = positions[i]
             heading = headings[i]
 
+            char = next((c for c in props.characters if c.name == char_name), None)
+            if not char:
+                continue
+
             for p_idx, c in enumerate(props.characters):
-                if c == char:
+                if c.name == char.name:
                     props.active_character_index = p_idx
                     break
 
@@ -3510,9 +3585,9 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
                 arm_obj.location = mathutils.Vector((x, y, z))
                 arm_obj.rotation_euler.z = heading
 
-            if i != 0 and char != source_char:
+            if i != 0 and source_char_obj and char.name != source_char_name:
                 offset_vec = (x - x0, y - y0, z - z0)
-                copy_character_prompt_schedule(source_char, char, context, offset_vec=offset_vec, offset_waypoints=offset_waypoints)
+                copy_character_prompt_schedule(source_char_obj, char, context, offset_vec=offset_vec, offset_waypoints=offset_waypoints)
 
         # Parent Empty object setup (reuse if regenerating, else create new)
         col_name = "ARDY_Crowds"
@@ -3548,11 +3623,15 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
             crowd_item.name = crowd_name
             crowd_item.empty_object_name = crowd_empty.name
 
-        crowd_char_names = []
         crowd_char_indices = []
-        for i, char in enumerate(crowd_chars):
-            crowd_char_names.append(char.name)
-            parent_character_items_to_crowd(char, crowd_empty)
+        for i, char_name in enumerate(crowd_char_names):
+            char = next((c for c in props.characters if c.name == char_name), None)
+            if char:
+                parent_character_items_to_crowd(char, crowd_empty)
+                for p_idx, c in enumerate(props.characters):
+                    if c.name == char.name:
+                        crowd_char_indices.append(p_idx)
+                        break
             for p_idx, c in enumerate(props.characters):
                 if c == char:
                     crowd_char_indices.append(p_idx)
