@@ -36,8 +36,16 @@ bl_info = {
 ### - list of nla strip recorded (name is the prompts) (TALVEZ) , pois ja tenho essa função no SAM
 
 #---------------------------------
-## V1.1
-## - adicionar crowd generation, colocar parametros para adicionar N quantidade de personagens e gerar uma animação para cada um deles, usando os mesmos prompts
+## V1.01
+## OK - adicionar crowd generation, colocar parametros para adicionar N quantidade de personagens e gerar uma animação para cada um deles, usando os mesmos prompts
+
+## V1.01 Wip2
+## OK - Adicionar opção para que personagens nao atravessem outros.
+## - Criar list com os crowds
+## - Opção para regerar, recriando reganrando as opções ativas par ao crowd ou ignorando a geração dos avoid
+## - Gerenciamento dos crows, e opçao de esconder
+## - 
+
 
 
 import bpy

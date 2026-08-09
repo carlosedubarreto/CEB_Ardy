@@ -218,6 +218,15 @@ def get_or_create_pose_constraint_armature(context, item, copy_current_pose=True
 
         item.pose_armature_name = obj.name
 
+        char = get_active_character(context)
+        if char:
+            crowd = get_crowd_for_character(char.name, context)
+            if crowd and crowd.empty_object_name:
+                crowd_empty = bpy.data.objects.get(crowd.empty_object_name)
+                if crowd_empty:
+                    obj.parent = crowd_empty
+                    obj.matrix_parent_inverse = crowd_empty.matrix_world.inverted()
+
     return obj
 
 def send_pose_constraints_to_bridge(context=None, start_frame=None):
@@ -397,6 +406,10 @@ def sync_prompt_item_object_names(item, context=None):
     char = get_active_character(context)
     prefix = get_char_prefix(char)
 
+    crowd = get_crowd_for_character(char.name, context) if char else None
+    crowd_empty = bpy.data.objects.get(crowd.empty_object_name) if (crowd and crowd.empty_object_name) else None
+    inv_mat = crowd_empty.matrix_world.inverted() if crowd_empty else None
+
     # 1. Update Pose Constraint Armature Object Name
     if getattr(item, "has_pose_constraint", False):
         arm_name = getattr(item, "pose_armature_name", "")
@@ -425,6 +438,10 @@ def sync_prompt_item_object_names(item, context=None):
                 item.pose_armature_name = obj.name
                 print(f"[CEB Ardy] Automatically updated pose constraint armature name to '{obj.name}'")
 
+            if crowd_empty and obj.parent != crowd_empty:
+                obj.parent = crowd_empty
+                obj.matrix_parent_inverse = inv_mat
+
     # 2. Update Waypoint Empty Object Name
     if getattr(item, "has_waypoint", False):
         wp_name = getattr(item, "waypoint_object_name", "")
@@ -450,6 +467,10 @@ def sync_prompt_item_object_names(item, context=None):
                 wp_obj.name = new_name
                 item.waypoint_object_name = wp_obj.name
                 print(f"[CEB Ardy] Automatically updated waypoint object name to '{wp_obj.name}'")
+
+            if crowd_empty and wp_obj.parent != crowd_empty:
+                wp_obj.parent = crowd_empty
+                wp_obj.matrix_parent_inverse = inv_mat
 
 def update_prompt_item(self, context):
     global _realtime_client, _active_stream_operator
@@ -581,6 +602,143 @@ class CEB_Ardy_Character(bpy.types.PropertyGroup):
     mesh_obj_name: bpy.props.StringProperty(default="")
     parent_obj_name: bpy.props.StringProperty(default="")
 
+def update_crowd_hide(self, context):
+    tag_redraw_view3d(context)
+    hide_val = getattr(self, "hide_viewport", False)
+    
+    # 1. Hide/Unhide the Crowd Empty object
+    if self.empty_object_name:
+        empty_obj = bpy.data.objects.get(self.empty_object_name)
+        if empty_obj:
+            empty_obj.hide_viewport = hide_val
+            empty_obj.hide_set(hide_val)
+
+    # 2. Hide/Unhide all characters belonging to this crowd
+    char_names = [n.strip() for n in self.character_names.split(",") if n.strip()]
+    props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
+    
+    for c_name in char_names:
+        clean_prefix = c_name.replace(" ", "_")
+        char_item = None
+        if props:
+            for c in props.characters:
+                if c.name == c_name:
+                    char_item = c
+                    break
+
+        arm_name = char_item.arm_obj_name if (char_item and char_item.arm_obj_name) else f"{clean_prefix}_Armature"
+        mesh_name = char_item.mesh_obj_name if (char_item and char_item.mesh_obj_name) else f"{clean_prefix}_Skin"
+
+        for o_name in (arm_name, mesh_name):
+            obj = bpy.data.objects.get(o_name)
+            if obj:
+                obj.hide_viewport = hide_val
+                obj.hide_set(hide_val)
+
+        if char_item:
+            for pitem in char_item.prompt_schedule:
+                if pitem.waypoint_object_name:
+                    wp_obj = bpy.data.objects.get(pitem.waypoint_object_name)
+                    if wp_obj:
+                        wp_obj.hide_viewport = hide_val
+                        wp_obj.hide_set(hide_val)
+                if getattr(pitem, "pose_armature_name", ""):
+                    pc_obj = bpy.data.objects.get(pitem.pose_armature_name)
+                    if pc_obj:
+                        pc_obj.hide_viewport = hide_val
+                        pc_obj.hide_set(hide_val)
+
+def get_crowd_for_character(char_name, context=None):
+    if context is None:
+        context = bpy.context
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return None
+    props = context.scene.ceb_ardy
+    for crowd in props.crowds:
+        char_names = [n.strip() for n in crowd.character_names.split(",") if n.strip()]
+        if char_name in char_names:
+            return crowd
+    return None
+
+def parent_character_items_to_crowd(char, crowd_empty):
+    if not char or not crowd_empty:
+        return
+    inv_mat = crowd_empty.matrix_world.inverted()
+
+    # Parent character armature
+    clean_prefix = char.name.replace(" ", "_")
+    arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+    arm_obj = bpy.data.objects.get(arm_name)
+    if arm_obj and arm_obj.parent != crowd_empty:
+        arm_obj.parent = crowd_empty
+        arm_obj.matrix_parent_inverse = inv_mat
+
+    # Parent waypoints & pose constraints belonging to this character
+    for pitem in char.prompt_schedule:
+        if pitem.waypoint_object_name:
+            wp_obj = bpy.data.objects.get(pitem.waypoint_object_name)
+            if wp_obj and wp_obj.parent != crowd_empty:
+                wp_obj.parent = crowd_empty
+                wp_obj.matrix_parent_inverse = inv_mat
+        if getattr(pitem, "pose_armature_name", ""):
+            pc_obj = bpy.data.objects.get(pitem.pose_armature_name)
+            if pc_obj and pc_obj.parent != crowd_empty:
+                pc_obj.parent = crowd_empty
+                pc_obj.matrix_parent_inverse = inv_mat
+
+def update_active_crowd(self, context):
+    tag_redraw_view3d(context)
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return
+    props = context.scene.ceb_ardy
+    crowd = get_active_crowd(context)
+    if crowd and crowd.empty_object_name:
+        empty_obj = bpy.data.objects.get(crowd.empty_object_name)
+        if empty_obj and not crowd.hide_viewport:
+            try:
+                if context.active_object and context.active_object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                for obj in context.view_layer.objects:
+                    obj.select_set(False)
+                empty_obj.select_set(True)
+                context.view_layer.objects.active = empty_obj
+            except Exception:
+                pass
+
+class CEB_Ardy_CrowdItem(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(
+        name="Name",
+        description="Crowd name",
+        default="Crowd_1",
+        update=tag_redraw_view3d
+    )
+    empty_object_name: bpy.props.StringProperty(
+        name="Parent Empty Object",
+        default=""
+    )
+    character_names: bpy.props.StringProperty(
+        name="Character Names",
+        description="Comma-separated names of characters in this crowd",
+        default=""
+    )
+    hide_viewport: bpy.props.BoolProperty(
+        name="Hide Crowd in Viewport",
+        description="Toggle visibility of this crowd and all its characters in the 3D Viewport",
+        default=False,
+        update=update_crowd_hide
+    )
+    clear_settings_before_generate: bpy.props.BoolProperty(
+        name="Clear Settings Before Generate",
+        description="If enabled, removes all waypoints and pose constraints for the crowd's characters before generating. If disabled, re-runs streaming using existing positions, waypoints, and constraints without re-copying or re-calculating crowd layout.",
+        default=True
+    )
+    crowd_count: bpy.props.IntProperty(default=4)
+    layout_mode: bpy.props.StringProperty(default='GRID')
+    spacing: bpy.props.FloatProperty(default=2.5)
+    start_frame: bpy.props.IntProperty(default=1)
+    end_frame: bpy.props.IntProperty(default=250)
+    source_char_name: bpy.props.StringProperty(default="")
+
 def get_active_character(context=None):
     if context is None:
         context = bpy.context
@@ -591,6 +749,18 @@ def get_active_character(context=None):
         return props.characters[props.active_character_index]
     elif len(props.characters) > 0:
         return props.characters[0]
+    return None
+
+def get_active_crowd(context=None):
+    if context is None:
+        context = bpy.context
+    if not hasattr(context, "scene") or not hasattr(context.scene, "ceb_ardy"):
+        return None
+    props = context.scene.ceb_ardy
+    if 0 <= props.active_crowd_index < len(props.crowds):
+        return props.crowds[props.active_crowd_index]
+    elif len(props.crowds) > 0:
+        return props.crowds[0]
     return None
 
 def get_active_prompt_for_frame(props=None, frame=0, context=None):
@@ -616,22 +786,30 @@ def get_character_world_transform(char):
     if not char:
         return char_x, char_y, char_z, char_heading
 
+    # Ensure view layer dependency graph is updated so matrix_world is accurate
+    try:
+        if bpy.context and hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
+            bpy.context.view_layer.update()
+    except Exception:
+        pass
+
     clean_name = char.name.replace(" ", "_")
     arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
     arm_obj = bpy.data.objects.get(arm_name)
     
     if arm_obj:
-        root_bone = arm_obj.pose.bones[0] if (arm_obj.pose and arm_obj.pose.bones) else None
-        if root_bone:
-            world_matrix = arm_obj.matrix_world @ root_bone.matrix
-        else:
-            world_matrix = arm_obj.matrix_world
-        
+        world_matrix = arm_obj.matrix_world
         world_loc = world_matrix.to_translation()
         char_x = world_loc.x
         char_y = world_loc.y
         char_z = world_loc.z
         char_heading = world_matrix.to_euler().z
+        # Fallback to direct location if matrix_world is zero but location is set
+        if abs(char_x) < 1e-5 and abs(char_y) < 1e-5 and (abs(arm_obj.location.x) > 1e-4 or abs(arm_obj.location.y) > 1e-4):
+            char_x = arm_obj.location.x
+            char_y = arm_obj.location.y
+            char_z = arm_obj.location.z
+            char_heading = arm_obj.rotation_euler.z
     else:
         parent_name = char.parent_obj_name if char.parent_obj_name else f"ARDY_Character_{clean_name}"
         parent_obj = bpy.data.objects.get(parent_name)
@@ -643,6 +821,7 @@ def get_character_world_transform(char):
             char_heading = parent_obj.matrix_world.to_euler().z
             
     return char_x, char_y, char_z, char_heading
+
 
 _reset_id_counter = 0
 
@@ -679,7 +858,18 @@ def update_active_character(self, context):
     tag_redraw_view3d(context)
     
     char = get_active_character(context)
-    if char:
+    if char and hasattr(context, "scene") and hasattr(context.scene, "ceb_ardy"):
+        crowd = get_crowd_for_character(char.name, context)
+        if crowd and crowd.hide_viewport:
+            try:
+                if context.active_object and context.active_object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                for o in context.view_layer.objects:
+                    o.select_set(False)
+            except Exception:
+                pass
+            return
+
         clean_name = char.name.replace(" ", "_")
         arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
         arm_obj = bpy.data.objects.get(arm_name)
@@ -714,6 +904,19 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         name="Active Character",
         default=0,
         update=update_active_character
+    )
+    crowds: bpy.props.CollectionProperty(
+        type=CEB_Ardy_CrowdItem
+    )
+    active_crowd_index: bpy.props.IntProperty(
+        name="Active Crowd Index",
+        default=0,
+        update=update_active_crowd
+    )
+    show_crowd_options: bpy.props.BoolProperty(
+        name="Show Crowd Options",
+        description="Toggle display of crowd options in the panel",
+        default=True
     )
     quantize_4bit: bpy.props.BoolProperty(
         name="4-bit Quantization (bitsandbytes)",
@@ -811,10 +1014,57 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     crowd_count: bpy.props.IntProperty(
         name="Crowd Count",
         description="Number of characters in the crowd",
-        default=10,
+        default=4,
         min=1,
         max=500
     )
+    crowd_spacing: bpy.props.FloatProperty(
+        name="Spacing (m)",
+        description="Distance between crowd characters in meters",
+        default=2.5,
+        min=0.5,
+        max=50.0
+    )
+    crowd_layout: bpy.props.EnumProperty(
+        name="Layout Pattern",
+        description="Spatial layout pattern for crowd characters",
+        items=[
+            ('GRID', "Grid", "Arrange characters in a 2D grid array"),
+            ('LINE', "Line", "Arrange characters in a single row line"),
+            ('CIRCLE', "Circle", "Arrange characters in a circular ring facing outward"),
+            ('RANDOM', "Random Scatter", "Randomly scatter characters with guaranteed minimum separation distance"),
+        ],
+        default='GRID'
+    )
+    crowd_offset_waypoints: bpy.props.BoolProperty(
+        name="Parallel Trajectories",
+        description="Offset waypoints relative to each character's starting position so movement paths run parallel and do not overlap",
+        default=True
+    )
+    crowd_avoid_collisions: bpy.props.BoolProperty(
+        name="Avoid Character Collisions",
+        description="Automatically insert detour waypoints to steer characters around previously simulated characters and prevent overlapping paths",
+        default=True
+    )
+    crowd_avoid_unsimulated: bpy.props.BoolProperty(
+        name="Avoid Standing Locations",
+        description="Steer characters around initial standing locations of other characters that have not been simulated yet",
+        default=False
+    )
+    crowd_avoid_radius: bpy.props.FloatProperty(
+        name="Safety Buffer (m)",
+        description="Minimum distance kept between characters to prevent collision",
+        default=0.7,
+        min=0.5,
+        max=10.0
+    )
+    crowd_reverse_order: bpy.props.BoolProperty(
+        name="Reverse Simulation Order",
+        description="Simulate characters starting from the last character in the list down to the first",
+        default=True
+    )
+
+
     crowd_start_frame: bpy.props.IntProperty(
         name="Start Frame",
         description="Start frame for crowd animation",
@@ -827,6 +1077,8 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         default=250,
         min=1
     )
+
+
 
 
 class CEB_OT_AddCharacterEntry(bpy.types.Operator):
@@ -2510,7 +2762,12 @@ def prepare_armature_for_streaming(arm_obj, char, context=None):
             push_action_to_nla_track(arm_obj, old_act)
         anim_data.action = None
 
+    if arm_obj.pose:
+        for b in arm_obj.pose.bones:
+            b.location = mathutils.Vector((0.0, 0.0, 0.0))
+
     # 3. Create a new NLA action for this stream session
+
     act_name = get_stream_action_name(char)
     new_act = bpy.data.actions.new(name=act_name)
     new_act.use_fake_user = True
@@ -2760,7 +3017,7 @@ class CEB_OT_RetargetMHR(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def copy_character_prompt_schedule(source_char, target_char, context):
+def copy_character_prompt_schedule(source_char, target_char, context, offset_vec=(0.0, 0.0, 0.0), offset_waypoints=True):
     if source_char == target_char:
         return
     for item in list(target_char.prompt_schedule):
@@ -2777,17 +3034,208 @@ def copy_character_prompt_schedule(source_char, target_char, context):
         new_item.enabled = src_item.enabled
         new_item.has_waypoint = src_item.has_waypoint
         if src_item.has_waypoint:
-            new_item.waypoint_co = src_item.waypoint_co
+            if offset_waypoints and offset_vec:
+                new_item.waypoint_co = (
+                    src_item.waypoint_co[0] + offset_vec[0],
+                    src_item.waypoint_co[1] + offset_vec[1],
+                    src_item.waypoint_co[2] + offset_vec[2]
+                )
+            else:
+                new_item.waypoint_co = src_item.waypoint_co
             get_or_create_waypoint_empty(context, new_item)
         new_item.has_pose_constraint = src_item.has_pose_constraint
-        if src_item.has_pose_constraint:
-            get_or_create_pose_constraint_armature(context, new_item, copy_current_pose=True)
+_recorded_crowd_trajectories = {}
+
+def generate_collision_avoidance_waypoints(char_k, char_idx, start_frame, end_frame, avoid_radius, context):
+    global _recorded_crowd_trajectories
+
+    props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
+
+    # 1. Collect dynamic trajectories from previously simulated characters
+    prev_trajectories = [
+        (name, traj) for name, traj in _recorded_crowd_trajectories.items()
+        if name != char_k.name and traj
+    ]
+
+    # 2. Collect initial standing locations from unsimulated characters if option is enabled
+    unsimulated_positions = []
+    if props and getattr(props, "crowd_avoid_unsimulated", True):
+        for other_char in props.characters:
+            if other_char == char_k:
+                continue
+            if other_char.name not in _recorded_crowd_trajectories:
+                ox, oy, oz, _ = get_character_world_transform(other_char)
+                unsimulated_positions.append((other_char.name, mathutils.Vector((ox, oy, oz))))
+
+    if not prev_trajectories and not unsimulated_positions:
+        return
+
+    clean_prefix = char_k.name.replace(" ", "_")
+    arm_name = char_k.arm_obj_name if char_k.arm_obj_name else f"{clean_prefix}_Armature"
+    arm_obj = bpy.data.objects.get(arm_name)
+    if not arm_obj:
+        return
+
+    start_loc = arm_obj.matrix_world.to_translation().copy()
+
+    dest_loc = start_loc.copy()
+    existing_wps = [item for item in char_k.prompt_schedule if item.enabled and getattr(item, "has_waypoint", False)]
+    if existing_wps:
+        wp_item = existing_wps[0]
+        if wp_item.waypoint_object_name and bpy.data.objects.get(wp_item.waypoint_object_name):
+            dest_loc = bpy.data.objects[wp_item.waypoint_object_name].matrix_world.to_translation().copy()
+        else:
+            dest_loc = mathutils.Vector(wp_item.waypoint_co)
+    else:
+        forward_dir = arm_obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 1.0, 0.0))
+        dest_loc = start_loc + forward_dir * 10.0
+
+    total_frames = max(1, end_frame - start_frame)
+    step_frames = 20
+    min_avoid_frame = start_frame + 15
+
+    # Calculate average forward speed (meters per frame) from recorded trajectories
+    speed_m_per_frame = 0.045  # Default ~1.1 m/s at 25 fps
+    recorded_speeds = []
+    for _name, traj in prev_trajectories:
+        if len(traj) >= 2:
+            frames = sorted(traj.keys())
+            first_f, last_f = frames[0], frames[-1]
+            if last_f > first_f:
+                total_d = (traj[last_f] - traj[first_f]).length
+                recorded_speeds.append(total_d / float(last_f - first_f))
+    if recorded_speeds:
+        speed_m_per_frame = max(0.02, sum(recorded_speeds) / len(recorded_speeds))
+
+    window_frames = 40  # Check obstacle positions within +-40 frames (~1.6s window)
+
+    for f in range(min_avoid_frame, end_frame + 1, step_frames):
+        frames_elapsed = f - start_frame
+        estimated_dist = speed_m_per_frame * frames_elapsed
+
+        if existing_wps:
+            wp_vec = dest_loc - start_loc
+            wp_dist = wp_vec.length
+            if wp_dist > 1e-4:
+                t_factor = min(1.0, estimated_dist / wp_dist)
+                curr_pos = start_loc.lerp(dest_loc, t_factor)
+            else:
+                curr_pos = start_loc.copy()
+        else:
+            forward_dir = arm_obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 1.0, 0.0))
+            if forward_dir.length > 1e-4:
+                forward_dir.normalize()
+            curr_pos = start_loc + forward_dir * estimated_dist
+
+        obstacles = []
+
+        # Check dynamic trajectories from previously simulated characters in time window [f - 40, f + 40]
+        for traj_name, prev_traj in prev_trajectories:
+            close_frames = [pf for pf in prev_traj.keys() if abs(pf - f) <= window_frames]
+            for pf in close_frames:
+                obstacles.append(prev_traj[pf])
+
+        # Check unsimulated standing obstacles
+        for _name, unsim_pos in unsimulated_positions:
+            obstacles.append(unsim_pos)
+
+        # Project positions onto the 2D ground plane (X, Y)
+        start_ground_z = start_loc.z
+
+        for other_pos in obstacles:
+            curr_pos_2d = mathutils.Vector((curr_pos.x, curr_pos.y, start_ground_z))
+            other_pos_2d = mathutils.Vector((other_pos.x, other_pos.y, start_ground_z))
+
+            dist = (curr_pos_2d - other_pos_2d).length
+            if dist < avoid_radius:
+                ray_dir = (dest_loc - start_loc) if existing_wps else (curr_pos - start_loc)
+                ray_dir_2d = mathutils.Vector((ray_dir.x, ray_dir.y, 0.0))
+                if ray_dir_2d.length > 1e-4:
+                    ray_dir_norm = ray_dir_2d.normalized()
+                    vec_to_obs = other_pos_2d - curr_pos_2d
+                    proj_length = vec_to_obs.dot(ray_dir_norm)
+                    proj_vec = ray_dir_norm * proj_length
+                    perp_to_obs = vec_to_obs - proj_vec
+                    if perp_to_obs.length > 1e-4:
+                        away_dir = -perp_to_obs.normalized()
+                    else:
+                        away_dir = mathutils.Vector((-ray_dir_norm.y, ray_dir_norm.x, 0.0)).normalized()
+                else:
+                    vec_away = curr_pos_2d - other_pos_2d
+                    vec_away.z = 0.0
+                    away_dir = vec_away.normalized() if vec_away.length > 1e-4 else mathutils.Vector((1.0, 0.0, 0.0))
+
+                away_dir.z = 0.0
+                if away_dir.length > 1e-4:
+                    away_dir.normalize()
+                else:
+                    away_dir = mathutils.Vector((1.0, 0.0, 0.0))
+
+                detour_dist = max(avoid_radius - dist + 0.6, avoid_radius * 0.6)
+                detour_offset = away_dir * detour_dist
+                detour_co = mathutils.Vector((curr_pos_2d.x + detour_offset.x, curr_pos_2d.y + detour_offset.y, start_ground_z))
+
+                existing_near = any(
+                    item.has_waypoint and abs(item.start_frame - f) < step_frames
+                    for item in char_k.prompt_schedule
+                )
+                if not existing_near:
+                    item = char_k.prompt_schedule.add()
+                    item.start_frame = f
+                    item.prompt = "walk"
+                    item.enabled = True
+                    item.has_waypoint = True
+                    item.waypoint_co = (detour_co.x, detour_co.y, detour_co.z)
+                    get_or_create_waypoint_empty(context, item)
+                    print(f"[CEB Ardy Collision Avoidance] Inserted detour waypoint for '{char_k.name}' at frame {f} (dist={dist:.2f}m < {avoid_radius:.2f}m, detour={detour_dist:.2f}m)")
+                    break
+
+
+
+
+class CEB_OT_ClearCrowdSettings(bpy.types.Operator):
+    bl_idname = "ceb.clear_crowd_settings"
+    bl_label = "Clear Crowd Settings"
+    bl_description = "Remove all waypoints and pose constraints for all characters in the selected crowd"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        crowd = get_active_crowd(context)
+        if not crowd:
+            self.report({'ERROR'}, "No active crowd selected.")
+            return {'CANCELLED'}
+
+        char_names = [n.strip() for n in crowd.character_names.split(",") if n.strip()]
+        cleared_count = 0
+        for c_name in char_names:
+            char_item = None
+            for c in props.characters:
+                if c.name == c_name:
+                    char_item = c
+                    break
+
+            if char_item:
+                for pitem in list(char_item.prompt_schedule):
+                    remove_waypoint_empty(pitem)
+                    remove_pose_constraint_armature(pitem)
+                char_item.prompt_schedule.clear()
+                item = char_item.prompt_schedule.add()
+                item.start_frame = props.crowd_start_frame
+                item.prompt = char_item.realtime_prompt if char_item.realtime_prompt else "walk"
+                item.enabled = True
+                cleared_count += 1
+
+        self.report({'INFO'}, f"Cleared waypoints and constraints for {cleared_count} characters in crowd '{crowd.name}'.")
+        return {'FINISHED'}
 
 
 class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
+
     bl_idname = "ceb.generate_crowd_animation"
     bl_label = "Generate Crowd Animation"
     bl_description = "Generate crowd characters and produce animations for all of them automatically using active character's prompts"
+
+    is_regenerating: bpy.props.BoolProperty(default=False)
 
     def execute(self, context):
         paths, err = get_ardy_paths(context)
@@ -2796,25 +3244,85 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
             return {'CANCELLED'}
 
         props = context.scene.ceb_ardy
-        source_char = get_active_character(context)
-        if not source_char:
-            self.report({'ERROR'}, "No active character found in character list.")
-            return {'CANCELLED'}
+        active_crowd = get_active_crowd(context) if self.is_regenerating else None
 
-        target_count = props.crowd_count
         start_frame = props.crowd_start_frame
         end_frame = props.crowd_end_frame
+        spacing = props.crowd_spacing
+        layout_mode = props.crowd_layout
+        offset_waypoints = props.crowd_offset_waypoints
 
         if start_frame >= end_frame:
             self.report({'ERROR'}, "Start frame must be less than end frame.")
             return {'CANCELLED'}
+
+        # Clear recorded trajectories from any previous crowd generation run
+        global _recorded_crowd_trajectories
+        _recorded_crowd_trajectories.clear()
 
         # 1. Set scene start and end frames
         context.scene.frame_start = start_frame
         context.scene.frame_end = end_frame
         context.scene.frame_current = start_frame
 
-        # 2. Ensure target_count characters exist in props.characters
+        # CASE 1: Regenerating with Clear Settings DISABLED
+        if self.is_regenerating and active_crowd and not active_crowd.clear_settings_before_generate:
+            char_names = [n.strip() for n in active_crowd.character_names.split(",") if n.strip()]
+            crowd_char_indices = []
+            for c_name in char_names:
+                for idx, c in enumerate(props.characters):
+                    if c.name == c_name:
+                        crowd_char_indices.append(idx)
+                        break
+
+            if not crowd_char_indices:
+                self.report({'ERROR'}, f"No valid characters found for crowd '{active_crowd.name}'.")
+                return {'CANCELLED'}
+
+            reverse_order = getattr(props, "crowd_reverse_order", False)
+            char_indices = list(reversed(crowd_char_indices)) if reverse_order else list(crowd_char_indices)
+            first_idx = char_indices[0]
+
+            props.active_character_index = first_idx
+            tag_redraw_view3d(context)
+
+            global _realtime_running
+            if _realtime_running:
+                bpy.ops.ceb.ardy_realtime_stream()
+
+            CEB_OT_ArdyRealtimeStream._is_crowd_generating = True
+            CEB_OT_ArdyRealtimeStream._crowd_char_indices = char_indices
+            CEB_OT_ArdyRealtimeStream._crowd_current_char_idx = 0
+            CEB_OT_ArdyRealtimeStream._crowd_start_frame = start_frame
+            CEB_OT_ArdyRealtimeStream._crowd_end_frame = end_frame
+
+            try:
+                res = bpy.ops.ceb.ardy_realtime_stream()
+                if res in ({'FINISHED'}, {'RUNNING_MODAL'}):
+                    self.report({'INFO'}, f"Regenerating motion for crowd '{active_crowd.name}' (using existing settings & waypoints)...")
+                    return {'FINISHED'}
+                else:
+                    CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
+                    self.report({'ERROR'}, "Failed to start ARDY stream for crowd regeneration.")
+                    return {'CANCELLED'}
+            except Exception as e:
+                CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
+                self.report({'ERROR'}, f"Could not connect to ARDY bridge: {e}")
+                return {'CANCELLED'}
+
+        # CASE 2: New Crowd OR Regenerating with Clear Settings ENABLED
+        source_char = get_active_character(context)
+        if not source_char:
+            self.report({'ERROR'}, "No active character found in character list.")
+            return {'CANCELLED'}
+
+        # If regenerating with Clear Settings enabled, clear waypoints/constraints for crowd's characters
+        if self.is_regenerating and active_crowd and active_crowd.clear_settings_before_generate:
+            bpy.ops.ceb.clear_crowd_settings()
+
+        target_count = props.crowd_count
+
+        # Ensure target_count characters exist in props.characters
         current_count = len(props.characters)
         if current_count < target_count:
             for idx in range(current_count + 1, target_count + 1):
@@ -2826,19 +3334,67 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
                 c.name = name
                 c.model = 'core'
 
-        # 3. Calculate spatial grid layout for crowd positioning
         num_chars = min(target_count, len(props.characters))
-        cols = math.ceil(math.sqrt(num_chars))
-        spacing = 2.0  # 2 meters between characters
+
+        # Calculate spatial positions and headings based on selected layout pattern
+        positions = []
+        headings = []
+
+        if layout_mode == 'LINE':
+            for i in range(num_chars):
+                x = (i - (num_chars - 1) / 2.0) * spacing
+                y = 0.0
+                z = 0.0
+                positions.append((x, y, z))
+                headings.append(0.0)
+        elif layout_mode == 'CIRCLE':
+            radius = max(spacing, (num_chars * spacing) / (2 * math.pi))
+            for i in range(num_chars):
+                angle = (2 * math.pi * i) / num_chars
+                x = radius * math.cos(angle)
+                y = radius * math.sin(angle)
+                z = 0.0
+                positions.append((x, y, z))
+                headings.append(angle)
+        elif layout_mode == 'RANDOM':
+            import random
+            positions = [(0.0, 0.0, 0.0)]
+            headings = [0.0]
+            max_attempts = 1000
+            for i in range(1, num_chars):
+                placed = False
+                radius_search = spacing * math.sqrt(num_chars)
+                for _ in range(max_attempts):
+                    rx = random.uniform(-radius_search, radius_search)
+                    ry = random.uniform(-radius_search, radius_search)
+                    if all(math.hypot(rx - px, ry - py) >= spacing for px, py, _ in positions):
+                        positions.append((rx, ry, 0.0))
+                        headings.append(random.uniform(0, 2 * math.pi))
+                        placed = True
+                        break
+                if not placed:
+                    x = (i % 5 - 2) * spacing
+                    y = (i // 5 - 2) * spacing
+                    positions.append((x, y, 0.0))
+                    headings.append(0.0)
+        else:  # GRID default
+            cols = math.ceil(math.sqrt(num_chars))
+            for i in range(num_chars):
+                row_idx = i // cols
+                col_idx = i % cols
+                x = (col_idx - (cols - 1) / 2.0) * spacing
+                y = (row_idx - (math.ceil(num_chars / cols) - 1) / 2.0) * spacing
+                z = 0.0
+                positions.append((x, y, z))
+                headings.append(0.0)
+
+        # Base reference position for Character 0
+        x0, y0, z0 = positions[0]
 
         for i in range(num_chars):
-            row_idx = i // cols
-            col_idx = i % cols
-            x = (col_idx - (cols - 1) / 2.0) * spacing
-            y = (row_idx - (math.ceil(num_chars / cols) - 1) / 2.0) * spacing
-            z = 0.0
+            x, y, z = positions[i]
+            heading = headings[i]
 
-            # Set active character temporarily to perform character loading and prompt schedule copy
             props.active_character_index = i
             char = props.characters[i]
 
@@ -2852,21 +3408,89 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
 
             if arm_obj:
                 arm_obj.location = mathutils.Vector((x, y, z))
+                arm_obj.rotation_euler.z = heading
 
             if i != 0 and char != source_char:
-                copy_character_prompt_schedule(source_char, char, context)
+                offset_vec = (x - x0, y - y0, z - z0)
+                copy_character_prompt_schedule(source_char, char, context, offset_vec=offset_vec, offset_waypoints=offset_waypoints)
 
-        # 4. Reset active character to 0 to begin sequential stream generation
-        props.active_character_index = 0
+        # Parent Empty object setup (reuse if regenerating, else create new)
+        col_name = "ARDY_Crowds"
+        collection = bpy.data.collections.get(col_name)
+        if not collection:
+            collection = bpy.data.collections.new(col_name)
+            context.scene.collection.children.link(collection)
+
+        avg_x = sum(p[0] for p in positions) / float(num_chars)
+        avg_y = sum(p[1] for p in positions) / float(num_chars)
+
+        if self.is_regenerating and active_crowd and active_crowd.empty_object_name and bpy.data.objects.get(active_crowd.empty_object_name):
+            crowd_empty = bpy.data.objects[active_crowd.empty_object_name]
+            crowd_empty.location = mathutils.Vector((avg_x, avg_y, 0.0))
+            crowd_item = active_crowd
+        else:
+            crowd_idx = len(props.crowds) + 1
+            crowd_name = f"Crowd_{crowd_idx}"
+            empty_base = f"ARDY_{crowd_name}"
+            empty_name = empty_base
+            e_cnt = 1
+            while bpy.data.objects.get(empty_name):
+                empty_name = f"{empty_base}_{e_cnt}"
+                e_cnt += 1
+
+            crowd_empty = bpy.data.objects.new(empty_name, None)
+            crowd_empty.empty_display_type = 'CUBE'
+            crowd_empty.empty_display_size = 1.0
+            crowd_empty.location = mathutils.Vector((avg_x, avg_y, 0.0))
+            collection.objects.link(crowd_empty)
+
+            crowd_item = props.crowds.add()
+            crowd_item.name = crowd_name
+            crowd_item.empty_object_name = crowd_empty.name
+
+        crowd_char_names = []
+        for i in range(num_chars):
+            char = props.characters[i]
+            crowd_char_names.append(char.name)
+            parent_character_items_to_crowd(char, crowd_empty)
+
+        crowd_item.character_names = ",".join(crowd_char_names)
+        crowd_item.crowd_count = num_chars
+        crowd_item.layout_mode = layout_mode
+        crowd_item.spacing = spacing
+        crowd_item.start_frame = start_frame
+        crowd_item.end_frame = end_frame
+        crowd_item.source_char_name = source_char.name
+
+        # Force Blender dependency graph to evaluate all updated armature locations immediately
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+
+        # Determine simulation character sequence order
+        reverse_order = getattr(props, "crowd_reverse_order", False)
+        char_indices = list(reversed(range(num_chars))) if reverse_order else list(range(num_chars))
+        first_idx = char_indices[0]
+
+        props.active_character_index = first_idx
         tag_redraw_view3d(context)
 
-        # 5. Start real-time stream in crowd generation mode
-        global _realtime_running
+        # Generate collision avoidance waypoints for initial character against unsimulated standing characters
+        if getattr(props, "crowd_avoid_collisions", True):
+            char_first = props.characters[first_idx] if len(props.characters) > first_idx else None
+            if char_first:
+                generate_collision_avoidance_waypoints(
+                    char_first, first_idx, start_frame, end_frame,
+                    getattr(props, "crowd_avoid_radius", 1.8), context
+                )
+
+        # Start real-time stream in crowd generation mode
         if _realtime_running:
             bpy.ops.ceb.ardy_realtime_stream()
 
         CEB_OT_ArdyRealtimeStream._is_crowd_generating = True
-        CEB_OT_ArdyRealtimeStream._crowd_char_indices = list(range(num_chars))
+        CEB_OT_ArdyRealtimeStream._crowd_char_indices = char_indices
         CEB_OT_ArdyRealtimeStream._crowd_current_char_idx = 0
         CEB_OT_ArdyRealtimeStream._crowd_start_frame = start_frame
         CEB_OT_ArdyRealtimeStream._crowd_end_frame = end_frame
@@ -2874,7 +3498,7 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
         try:
             res = bpy.ops.ceb.ardy_realtime_stream()
             if res in ({'FINISHED'}, {'RUNNING_MODAL'}):
-                self.report({'INFO'}, f"Crowd generation started for {num_chars} characters (Frames {start_frame}..{end_frame})...")
+                self.report({'INFO'}, f"Crowd generation started for crowd '{crowd_item.name}' ({num_chars} characters)...")
                 return {'FINISHED'}
             else:
                 CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
@@ -2884,6 +3508,7 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
             CEB_OT_ArdyRealtimeStream._is_crowd_generating = False
             self.report({'ERROR'}, "Could not connect to ARDY real-time bridge. Please click 'Start Bridge' first.")
             return {'CANCELLED'}
+
 
 
 
@@ -3182,6 +3807,25 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
         if props.realtime_recording:
             context.scene.frame_current += 1
 
+        # Record frame trajectory for crowd collision avoidance
+        # Use the actual root joint world position (joints[0] is in ARDY space; convert to Blender world space)
+        global _recorded_crowd_trajectories
+        if char:
+            if char.name not in _recorded_crowd_trajectories:
+                _recorded_crowd_trajectories[char.name] = {}
+            if joints and len(joints) > 0:
+                root_j = joints[0]  # ARDY space: [X_ardy, Y_ardy(up), Z_ardy(forward)]
+                # Convert ARDY -> Blender world: X_b=-X_a, Y_b=Z_a, Z_b=Y_a
+                root_world_b = mathutils.Vector((
+                    -float(root_j[0]) * scale,
+                     float(root_j[2]) * scale,
+                     float(root_j[1]) * scale,
+                ))
+                _recorded_crowd_trajectories[char.name][frame_num] = root_world_b
+            elif arm_obj:
+                # Fallback: armature object location (static, but better than nothing)
+                _recorded_crowd_trajectories[char.name][frame_num] = arm_obj.matrix_world.to_translation().copy()
+
         # Check multi-character crowd generation auto-advance
         if getattr(self, "_is_crowd_generating", False):
             end_f = getattr(self, "_crowd_end_frame", 250)
@@ -3198,10 +3842,17 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                     props.active_character_index = next_idx
                     next_char = props.characters[next_idx]
 
+                    if getattr(props, "crowd_avoid_collisions", True):
+                        generate_collision_avoidance_waypoints(
+                            next_char, next_idx, self._crowd_start_frame, self._crowd_end_frame,
+                            getattr(props, "crowd_avoid_radius", 1.8), context
+                        )
+
                     context.scene.frame_current = self._crowd_start_frame
                     self._start_frame = self._crowd_start_frame
 
                     clean_p = next_char.name.replace(" ", "_")
+
                     next_arm_name = next_char.arm_obj_name if next_char.arm_obj_name else f"{clean_p}_Armature"
                     next_arm_obj = bpy.data.objects.get(next_arm_name)
                     if next_arm_obj:
@@ -3736,12 +4387,197 @@ class CEB_OT_CancelIKControl(bpy.types.Operator):
         self.report({'INFO'}, "IK Control cancelled.")
         return {'FINISHED'}
 
+class CEB_OT_AddCrowdEntry(bpy.types.Operator):
+    bl_idname = "ceb.add_crowd_entry"
+    bl_label = "Add Crowd Entry"
+    bl_description = "Add a new empty crowd entry"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        idx = len(props.crowds) + 1
+        item = props.crowds.add()
+        item.name = f"Crowd_{idx}"
+        props.active_crowd_index = len(props.crowds) - 1
+        return {'FINISHED'}
+
+class CEB_OT_RemoveCrowdEntry(bpy.types.Operator):
+    bl_idname = "ceb.remove_crowd_entry"
+    bl_label = "Remove Crowd Entry"
+    bl_description = "Remove selected crowd entry from the list"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        if 0 <= props.active_crowd_index < len(props.crowds):
+            props.crowds.remove(props.active_crowd_index)
+            props.active_crowd_index = max(0, props.active_crowd_index - 1)
+        return {'FINISHED'}
+
+class CEB_OT_SelectCrowd(bpy.types.Operator):
+    bl_idname = "ceb.select_crowd"
+    bl_label = "Select Crowd in Viewport"
+    bl_description = "Select the crowd parent Empty and all linked character armatures/meshes in the 3D Viewport"
+
+    def execute(self, context):
+        crowd = get_active_crowd(context)
+        if not crowd:
+            self.report({'ERROR'}, "No active crowd selected.")
+            return {'CANCELLED'}
+
+        if context.active_object and context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        for obj in context.view_layer.objects:
+            obj.select_set(False)
+
+        selected_count = 0
+        empty_obj = bpy.data.objects.get(crowd.empty_object_name) if crowd.empty_object_name else None
+        if empty_obj:
+            empty_obj.select_set(True)
+            context.view_layer.objects.active = empty_obj
+            selected_count += 1
+
+        props = context.scene.ceb_ardy
+        char_names = [n.strip() for n in crowd.character_names.split(",") if n.strip()]
+        for c_name in char_names:
+            char_item = None
+            if props:
+                for c in props.characters:
+                    if c.name == c_name:
+                        char_item = c
+                        break
+            clean_prefix = c_name.replace(" ", "_")
+            arm_name = char_item.arm_obj_name if (char_item and char_item.arm_obj_name) else f"{clean_prefix}_Armature"
+            mesh_name = char_item.mesh_obj_name if (char_item and char_item.mesh_obj_name) else f"{clean_prefix}_Skin"
+
+            for o_name in (arm_name, mesh_name):
+                obj = bpy.data.objects.get(o_name)
+                if obj:
+                    obj.select_set(True)
+                    if context.view_layer.objects.active is None:
+                        context.view_layer.objects.active = obj
+                    selected_count += 1
+
+        self.report({'INFO'}, f"Selected crowd '{crowd.name}' ({selected_count} objects selected).")
+        return {'FINISHED'}
+
+class CEB_OT_ToggleHideCrowd(bpy.types.Operator):
+    bl_idname = "ceb.toggle_hide_crowd"
+    bl_label = "Toggle Hide Crowd"
+    bl_description = "Toggle visibility of all objects belonging to this crowd in the 3D Viewport"
+
+    index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        if self.index >= 0 and self.index < len(props.crowds):
+            crowd = props.crowds[self.index]
+        else:
+            crowd = get_active_crowd(context)
+
+        if not crowd:
+            return {'CANCELLED'}
+
+        crowd.hide_viewport = not crowd.hide_viewport
+        update_crowd_hide(crowd, context)
+        state_str = "hidden" if crowd.hide_viewport else "visible"
+        self.report({'INFO'}, f"Crowd '{crowd.name}' is now {state_str}.")
+        return {'FINISHED'}
+
+class CEB_OT_DeleteCrowd(bpy.types.Operator):
+    bl_idname = "ceb.delete_crowd"
+    bl_label = "Delete Crowd"
+    bl_description = "Delete the crowd parent Empty, all linked character armatures, meshes, waypoints, and character entries"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        crowd = get_active_crowd(context)
+        if not crowd:
+            self.report({'ERROR'}, "No active crowd selected.")
+            return {'CANCELLED'}
+
+        crowd_name = crowd.name
+        empty_obj_name = crowd.empty_object_name
+        char_names = [n.strip() for n in crowd.character_names.split(",") if n.strip()]
+
+        if context.active_object and context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # 1. Remove parent empty object
+        if empty_obj_name:
+            empty_obj = bpy.data.objects.get(empty_obj_name)
+            if empty_obj:
+                bpy.data.objects.remove(empty_obj, do_unlink=True)
+
+        # 2. Remove character objects & property entries
+        for c_name in char_names:
+            char_idx = None
+            for idx, c in enumerate(props.characters):
+                if c.name == c_name:
+                    char_idx = idx
+                    break
+
+            if char_idx is not None:
+                char_item = props.characters[char_idx]
+                for pitem in list(char_item.prompt_schedule):
+                    remove_waypoint_empty(pitem)
+                    remove_pose_constraint_armature(pitem)
+
+                clean_prefix = char_item.name.replace(" ", "_")
+                arm_name = char_item.arm_obj_name if char_item.arm_obj_name else f"{clean_prefix}_Armature"
+                mesh_name = char_item.mesh_obj_name if char_item.mesh_obj_name else f"{clean_prefix}_Skin"
+                parent_name = char_item.parent_obj_name if char_item.parent_obj_name else f"ARDY_Character_{clean_prefix}"
+
+                for o_name in (arm_name, mesh_name, parent_name):
+                    if o_name:
+                        obj = bpy.data.objects.get(o_name)
+                        if obj:
+                            bpy.data.objects.remove(obj, do_unlink=True)
+
+                props.characters.remove(char_idx)
+
+        # 3. Remove crowd item entry
+        crowd_idx = props.active_crowd_index
+        props.crowds.remove(crowd_idx)
+        props.active_crowd_index = max(0, crowd_idx - 1)
+        props.active_character_index = max(0, min(props.active_character_index, len(props.characters) - 1))
+
+        self.report({'INFO'}, f"Successfully deleted crowd '{crowd_name}' and all associated characters.")
+        return {'FINISHED'}
+
+class CEB_OT_RegenerateCrowd(bpy.types.Operator):
+    bl_idname = "ceb.regenerate_crowd"
+    bl_label = "Regenerate Crowd"
+    bl_description = "Regenerate crowd motion animations for all characters in the selected crowd"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        crowd = get_active_crowd(context)
+        if not crowd:
+            self.report({'ERROR'}, "No active crowd selected.")
+            return {'CANCELLED'}
+
+        props.crowd_count = crowd.crowd_count
+        props.crowd_layout = crowd.layout_mode
+        props.crowd_spacing = crowd.spacing
+        props.crowd_start_frame = crowd.start_frame
+        props.crowd_end_frame = crowd.end_frame
+
+        return bpy.ops.ceb.generate_crowd_animation(is_regenerating=True)
+
 classes = (
     CEB_Ardy_PromptItem,
     CEB_Ardy_Character,
+    CEB_Ardy_CrowdItem,
     CEB_Ardy_SceneProperties,
     CEB_OT_AddCharacterEntry,
     CEB_OT_RemoveCharacterEntry,
+    CEB_OT_AddCrowdEntry,
+    CEB_OT_RemoveCrowdEntry,
+    CEB_OT_SelectCrowd,
+    CEB_OT_ToggleHideCrowd,
+    CEB_OT_DeleteCrowd,
+    CEB_OT_ClearCrowdSettings,
+    CEB_OT_RegenerateCrowd,
     CEB_OT_AddPromptItem,
     CEB_OT_AddWaypoint,
     CEB_OT_RemoveWaypoint,

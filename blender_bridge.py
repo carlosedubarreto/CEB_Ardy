@@ -579,10 +579,17 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                                 print(f"[Bridge] Received 2D Root Waypoint: Frame {wp_frame} at Blender ({wp_xb:.2f}, {wp_yb:.2f}, {wp_zb:.2f}) -> ARDY Model Space ({wp_x_ardy:.2f}, 0.0, {wp_z_ardy:.2f})")
 
                                                 if hasattr(generator, "restart_from_now") and session.motion_tensor is not None and session.frame_idx > 0:
+                                                    # Generation is running: replan from current position
                                                     generator.restart_from_now(generator._client_id)
+                                                    print(f"[Bridge] Waypoint added: replanning from frame {session.frame_idx}")
                                                 elif session.motion_tensor is not None and session.frame_idx == 0:
+                                                    # Generation not yet started but tensor allocated: reset cleanly
                                                     reset_generator_session(generator, current_prompt)
                                                     prompt_just_changed = True
+                                                else:
+                                                    # motion_tensor is None: fresh session. Waypoint constraint
+                                                    # is already stored and will be respected by the first _generate_step.
+                                                    print(f"[Bridge] Waypoint queued for fresh session at frame {wp_frame}")
                                 except Exception as wpe:
                                     print(f"[Bridge] Error processing WAYPOINT command: {wpe}")
                             elif line == "CLEAR_POSE_CONSTRAINTS":

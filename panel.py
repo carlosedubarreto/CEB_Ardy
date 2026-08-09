@@ -8,10 +8,29 @@ class CEB_UL_CharacterList(bpy.types.UIList):
             clean_name = item.name.replace(" ", "_")
             arm_name = item.arm_obj_name if item.arm_obj_name else f"{clean_name}_Armature"
             is_loaded = bpy.data.objects.get(arm_name) is not None
-            
+
+            # Look up parent crowd membership
+            parent_crowd = None
+            if hasattr(context, "scene") and hasattr(context.scene, "ceb_ardy"):
+                for crowd in context.scene.ceb_ardy.crowds:
+                    char_names = [n.strip() for n in crowd.character_names.split(",") if n.strip()]
+                    if item.name in char_names:
+                        parent_crowd = crowd
+                        break
+
+            # Requirement 2: If crowd is hidden, disable character selection
+            if parent_crowd and parent_crowd.hide_viewport:
+                row.enabled = False
+
             status_icon = 'CHECKMARK' if is_loaded else 'DOT'
             row.label(text="", icon=status_icon)
             row.prop(item, "name", text="", emboss=False)
+
+            # Requirement 1: Show crowd name badge in character selection list
+            if parent_crowd:
+                crowd_icon = 'HIDE_ON' if parent_crowd.hide_viewport else 'COMMUNITY'
+                row.label(text=f"({parent_crowd.name})", icon=crowd_icon)
+
             row.label(text=item.model.upper())
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
@@ -38,6 +57,26 @@ class CEB_UL_PromptList(bpy.types.UIList):
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text=str(item.start_frame))
+
+class CEB_UL_CrowdList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            empty_name = item.empty_object_name if item.empty_object_name else f"ARDY_{item.name}"
+            is_loaded = bpy.data.objects.get(empty_name) is not None
+            
+            status_icon = 'CHECKMARK' if is_loaded else 'DOT'
+            row.label(text="", icon=status_icon)
+            row.prop(item, "name", text="", emboss=False)
+
+            hide_icon = 'HIDE_ON' if item.hide_viewport else 'HIDE_OFF'
+            op = row.operator("ceb.toggle_hide_crowd", text="", icon=hide_icon, emboss=False)
+            op.index = index
+
+            row.label(text=f"{item.crowd_count} Chars", icon='COMMUNITY')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text=item.name)
 
 class CEB_PT_ArdyPanel(bpy.types.Panel):
     bl_label = "CEB ARDY"
@@ -93,7 +132,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         viser_row.operator("ceb.ardy_run_demo", text="Start Viser Web App", icon='URL')
 
         # Ensure active character exists
-        from .operator import get_active_character
+        from .operator import get_active_character, get_active_crowd
         char = get_active_character(context)
 
         # --- Character Selector ---
@@ -137,18 +176,75 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
                 op = ik_row.operator("ceb.start_ik_control", text="IK Control Character", icon='CONSTRAINT_BONE')
                 op.target_type = 'CHARACTER'
 
-            # --- Crowd Generation ---
-            crowd_box = char_box.box()
-            crowd_box.enabled = not is_ik_active
-            crowd_box.label(text="Crowd Generation", icon='COMMUNITY')
-            crowd_col = crowd_box.column(align=True)
-            crowd_col.prop(props, "crowd_count", text="Characters Count")
-            frame_row = crowd_col.row(align=True)
-            frame_row.prop(props, "crowd_start_frame", text="Start Frame")
-            frame_row.prop(props, "crowd_end_frame", text="End Frame")
-            btn_row = crowd_box.row(align=True)
-            btn_row.scale_y = 1.3
-            btn_row.operator("ceb.generate_crowd_animation", text="Generate Crowd Animation", icon='GROUP')
+            # --- Crowd Options (Collapsible) ---
+            crowd_main_box = char_box.box()
+            crowd_main_box.enabled = not is_ik_active
+            
+            c_head = crowd_main_box.row(align=True)
+            c_icon = 'DISCLOSURE_TRI_DOWN' if props.show_crowd_options else 'DISCLOSURE_TRI_RIGHT'
+            c_head.prop(props, "show_crowd_options", text="Crowd Options", icon=c_icon, emboss=False)
+
+            if props.show_crowd_options:
+                # --- Crowd Generation ---
+                crowd_box = crowd_main_box.box()
+                crowd_box.enabled = not is_ik_active
+                crowd_box.label(text="Crowd Generation", icon='COMMUNITY')
+                crowd_col = crowd_box.column(align=True)
+                crowd_col.prop(props, "crowd_count", text="Characters Count")
+                
+                layout_row = crowd_col.row(align=True)
+                layout_row.prop(props, "crowd_layout", text="Layout")
+                layout_row.prop(props, "crowd_spacing", text="Spacing (m)")
+                
+                crowd_col.prop(props, "crowd_offset_waypoints", text="Parallel Trajectories (Offset Waypoints)")
+                crowd_col.prop(props, "crowd_reverse_order", text="Simulate From Last Character")
+                
+                avoid_row = crowd_col.row(align=True)
+
+                avoid_row.prop(props, "crowd_avoid_collisions", text="Avoid Collisions")
+                if props.crowd_avoid_collisions:
+                    avoid_row.prop(props, "crowd_avoid_radius", text="Buffer (m)")
+                    crowd_col.prop(props, "crowd_avoid_unsimulated", text="Avoid Standing Locations (Unsimulated)")
+
+                frame_row = crowd_col.row(align=True)
+                frame_row.prop(props, "crowd_start_frame", text="Start Frame")
+                frame_row.prop(props, "crowd_end_frame", text="End Frame")
+                btn_row = crowd_box.row(align=True)
+                btn_row.scale_y = 1.3
+                btn_row.operator("ceb.generate_crowd_animation", text="Generate Crowd Animation", icon='GROUP')
+
+                # --- Crowd Management ---
+                cr_mgmt_box = crowd_main_box.box()
+                cr_mgmt_box.enabled = not is_ik_active
+                cr_mgmt_box.label(text="Crowd Management", icon='COMMUNITY')
+
+                row = cr_mgmt_box.row()
+                row.enabled = not is_ik_active
+                row.template_list(
+                    "CEB_UL_CrowdList", "",
+                    props, "crowds",
+                    props, "active_crowd_index",
+                    rows=2
+                )
+                col = row.column(align=True)
+                col.enabled = not is_ik_active
+
+                active_crowd = get_active_crowd(context)
+                if active_crowd:
+                    c_details = cr_mgmt_box.box()
+                    c_details.enabled = not is_ik_active
+                    c_details.prop(active_crowd, "name", text="Name")
+                    if active_crowd.empty_object_name:
+                        c_details.label(text=f"Parent Empty: {active_crowd.empty_object_name}", icon='EMPTY_DATA')
+
+                    c_details.prop(active_crowd, "clear_settings_before_generate", text="Clear Settings Before Generate")
+
+                    c_btns = c_details.row(align=True)
+                    c_btns.scale_y = 1.2
+                    c_btns.operator("ceb.select_crowd", text="Select", icon='RESTRICT_SELECT_OFF')
+                    c_btns.operator("ceb.regenerate_crowd", text="Regenerate", icon='FILE_REFRESH')
+                    c_btns.operator("ceb.clear_crowd_settings", text="Clear Settings", icon='TRASH')
+                    c_btns.operator("ceb.delete_crowd", text="Delete", icon='TRASH')
 
         else:
             char_box = box.box()
@@ -265,6 +361,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
 classes = (
     CEB_UL_CharacterList,
     CEB_UL_PromptList,
+    CEB_UL_CrowdList,
     CEB_PT_ArdyPanel,
 )
 
