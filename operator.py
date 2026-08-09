@@ -3138,9 +3138,18 @@ def generate_collision_avoidance_waypoints(char_k, char_idx, start_frame, end_fr
         forward_dir = arm_obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 1.0, 0.0))
         dest_loc = start_loc + forward_dir * 10.0
 
-    total_frames = max(1, end_frame - start_frame)
-    step_frames = 20
-    min_avoid_frame = start_frame + 15
+    path_dir = dest_loc - start_loc
+    path_dir.z = 0.0
+    if path_dir.length < 1e-4:
+        path_dir = arm_obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 1.0, 0.0))
+        path_dir.z = 0.0
+    if path_dir.length > 1e-4:
+        path_dir.normalize()
+    else:
+        path_dir = mathutils.Vector((0.0, 1.0, 0.0))
+
+    # Right perpendicular vector to path
+    right_dir = mathutils.Vector((path_dir.y, -path_dir.x, 0.0)).normalized()
 
     # Calculate average forward speed (meters per frame) from recorded trajectories
     speed_m_per_frame = 0.045  # Default ~1.1 m/s at 25 fps
@@ -3155,93 +3164,104 @@ def generate_collision_avoidance_waypoints(char_k, char_idx, start_frame, end_fr
     if recorded_speeds:
         speed_m_per_frame = max(0.02, sum(recorded_speeds) / len(recorded_speeds))
 
-    window_frames = 40  # Check obstacle positions within +-40 frames (~1.6s window)
+    window_frames = 40
+    step_frames = 15
+    min_avoid_frame = start_frame + 15
 
-    for f in range(min_avoid_frame, end_frame + 1, step_frames):
+    first_conflict_frame = None
+    first_conflict_pos = None
+
+    for f in range(min_avoid_frame, end_frame, step_frames):
         frames_elapsed = f - start_frame
         estimated_dist = speed_m_per_frame * frames_elapsed
 
-        if existing_wps:
-            wp_vec = dest_loc - start_loc
-            wp_dist = wp_vec.length
-            if wp_dist > 1e-4:
-                t_factor = min(1.0, estimated_dist / wp_dist)
-                curr_pos = start_loc.lerp(dest_loc, t_factor)
-            else:
-                curr_pos = start_loc.copy()
+        wp_vec = dest_loc - start_loc
+        wp_dist = wp_vec.length
+        if wp_dist > 1e-4:
+            t_factor = min(1.0, estimated_dist / wp_dist)
+            curr_pos = start_loc.lerp(dest_loc, t_factor)
         else:
-            forward_dir = arm_obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 1.0, 0.0))
-            if forward_dir.length > 1e-4:
-                forward_dir.normalize()
-            curr_pos = start_loc + forward_dir * estimated_dist
+            curr_pos = start_loc + path_dir * estimated_dist
 
         obstacles = []
-
-        # Check dynamic trajectories from previously simulated characters in time window [f - 40, f + 40]
         for traj_name, prev_traj in prev_trajectories:
             close_frames = [pf for pf in prev_traj.keys() if abs(pf - f) <= window_frames]
             for pf in close_frames:
                 obstacles.append(prev_traj[pf])
-
-        # Check unsimulated standing obstacles
         for _name, unsim_pos in unsimulated_positions:
             obstacles.append(unsim_pos)
 
-        # Project positions onto the 2D ground plane (X, Y)
         start_ground_z = start_loc.z
+        curr_pos_2d = mathutils.Vector((curr_pos.x, curr_pos.y, start_ground_z))
 
         for other_pos in obstacles:
-            curr_pos_2d = mathutils.Vector((curr_pos.x, curr_pos.y, start_ground_z))
             other_pos_2d = mathutils.Vector((other_pos.x, other_pos.y, start_ground_z))
-
             dist = (curr_pos_2d - other_pos_2d).length
             if dist < avoid_radius:
-                ray_dir = (dest_loc - start_loc) if existing_wps else (curr_pos - start_loc)
-                ray_dir_2d = mathutils.Vector((ray_dir.x, ray_dir.y, 0.0))
-                if ray_dir_2d.length > 1e-4:
-                    ray_dir_norm = ray_dir_2d.normalized()
-                    vec_to_obs = other_pos_2d - curr_pos_2d
-                    proj_length = vec_to_obs.dot(ray_dir_norm)
-                    proj_vec = ray_dir_norm * proj_length
-                    perp_to_obs = vec_to_obs - proj_vec
-                    if perp_to_obs.length > 1e-4:
-                        away_dir = -perp_to_obs.normalized()
-                    else:
-                        away_dir = mathutils.Vector((-ray_dir_norm.y, ray_dir_norm.x, 0.0)).normalized()
-                else:
-                    vec_away = curr_pos_2d - other_pos_2d
-                    vec_away.z = 0.0
-                    away_dir = vec_away.normalized() if vec_away.length > 1e-4 else mathutils.Vector((1.0, 0.0, 0.0))
+                first_conflict_frame = f
+                first_conflict_pos = other_pos_2d
+                break
+        if first_conflict_frame is not None:
+            break
 
-                away_dir.z = 0.0
-                if away_dir.length > 1e-4:
-                    away_dir.normalize()
-                else:
-                    away_dir = mathutils.Vector((1.0, 0.0, 0.0))
+    if first_conflict_frame is None or first_conflict_pos is None:
+        return
 
-                detour_dist = max(avoid_radius - dist + 0.6, avoid_radius * 0.6)
-                detour_offset = away_dir * detour_dist
-                detour_co = mathutils.Vector((curr_pos_2d.x + detour_offset.x, curr_pos_2d.y + detour_offset.y, start_ground_z))
+    # Determine consistent detour side relative to path_dir
+    vec_to_obs = first_conflict_pos - start_loc
+    vec_to_obs.z = 0.0
+    side_dot = vec_to_obs.dot(right_dir)
 
-                existing_near = any(
-                    item.has_waypoint and abs(item.start_frame - f) < step_frames
-                    for item in char_k.prompt_schedule
-                )
-                if not existing_near:
-                    item = char_k.prompt_schedule.add()
-                    item.start_frame = f
-                    item.prompt = "walk"
-                    item.enabled = True
-                    item.has_waypoint = True
-                    item.waypoint_co = (detour_co.x, detour_co.y, detour_co.z)
-                    get_or_create_waypoint_empty(context, item)
-                    crowd = get_crowd_for_character(char_k.name, context)
-                    if crowd and crowd.empty_object_name:
-                        crowd_empty = bpy.data.objects.get(crowd.empty_object_name)
-                        if crowd_empty:
-                            parent_character_items_to_crowd(char_k, crowd_empty)
-                    print(f"[CEB Ardy Collision Avoidance] Inserted detour waypoint for '{char_k.name}' at frame {f} (dist={dist:.2f}m < {avoid_radius:.2f}m, detour={detour_dist:.2f}m)")
-                    break
+    # Detour away from obstacle: if obstacle is to the right (+right_dir), detour to the left (-right_dir)
+    detour_side = -right_dir if side_dot >= 0 else right_dir
+
+    # Fixed detour offset distance to clear obstacle comfortably
+    detour_dist = avoid_radius * 1.3
+    detour_shift = detour_side * detour_dist
+
+    # 1. Detour Entry Waypoint (Steer into new lane before obstacle)
+    detour_start_frame = max(start_frame + 10, first_conflict_frame - 15)
+    frames_to_entry = detour_start_frame - start_frame
+    dist_at_entry = speed_m_per_frame * frames_to_entry
+    entry_base_pos = start_loc + path_dir * dist_at_entry
+    entry_co = entry_base_pos + detour_shift
+    entry_co.z = start_loc.z
+
+    item_entry = char_k.prompt_schedule.add()
+    item_entry.start_frame = detour_start_frame
+    item_entry.prompt = "walk"
+    item_entry.enabled = True
+    item_entry.has_waypoint = True
+    item_entry.waypoint_co = (entry_co.x, entry_co.y, entry_co.z)
+    get_or_create_waypoint_empty(context, item_entry)
+
+    # 2. Detour Continuation Waypoint (A bit ahead in the new lane to keep on this new path)
+    detour_forward_frame = min(end_frame, first_conflict_frame + 30)
+    if detour_forward_frame <= detour_start_frame + 5:
+        detour_forward_frame = min(end_frame, detour_start_frame + 20)
+
+    frames_to_forward = detour_forward_frame - start_frame
+    dist_at_forward = speed_m_per_frame * frames_to_forward
+    forward_base_pos = start_loc + path_dir * dist_at_forward
+    forward_co = forward_base_pos + detour_shift
+    forward_co.z = start_loc.z
+
+    item_forward = char_k.prompt_schedule.add()
+    item_forward.start_frame = detour_forward_frame
+    item_forward.prompt = "walk"
+    item_forward.enabled = True
+    item_forward.has_waypoint = True
+    item_forward.waypoint_co = (forward_co.x, forward_co.y, forward_co.z)
+    get_or_create_waypoint_empty(context, item_forward)
+
+    # Parent newly created waypoint empties to crowd empty
+    crowd = get_crowd_for_character(char_k.name, context)
+    if crowd and crowd.empty_object_name:
+        crowd_empty = bpy.data.objects.get(crowd.empty_object_name)
+        if crowd_empty:
+            parent_character_items_to_crowd(char_k, crowd_empty)
+
+    print(f"[CEB Ardy Collision Avoidance] Detoured '{char_k.name}' to new lane at F{detour_start_frame} & F{detour_forward_frame} (offset={detour_dist:.2f}m), continuing on new path.")
 
 
 
