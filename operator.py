@@ -585,7 +585,7 @@ class CEB_Ardy_Character(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(
         name="Name",
         description="Character name",
-        default="Character_1",
+        default="Char_1",
         update=tag_redraw_view3d
     )
     model: bpy.props.EnumProperty(
@@ -862,7 +862,7 @@ def send_switch_char_cmd(char, active_prompt, frame, context):
 
     char_x, char_y, char_z, char_heading = get_character_world_transform(char)
     model = char.model if char else 'core'
-    char_name = char.name if char else 'Character_1'
+    char_name = char.name if char else 'Char_1'
     cmd = f"SWITCH_CHAR:{char_name}:{model}:{active_prompt}:{frame}:{char_x:.4f}:{char_y:.4f}:{char_z:.4f}:{char_heading:.4f}:{reset_id}\n"
     
     if _realtime_client:
@@ -1123,10 +1123,10 @@ class CEB_OT_AddCharacterEntry(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.ceb_ardy
         idx = len(props.characters) + 1
-        name = f"Character_{idx}"
+        name = f"Char_{idx}"
         while any(c.name == name for c in props.characters):
             idx += 1
-            name = f"Character_{idx}"
+            name = f"Char_{idx}"
         char = props.characters.add()
         char.name = name
         char.model = 'core'
@@ -2688,9 +2688,9 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
 def get_stream_action_name(char):
     """
     Generate action name based on character name, set prompts and count of waypoints and pose constraints.
-    Example: 'Character_1_walk_W1_C0' or 'Hero_walk, run_W2_C1'
+    Example: 'Char_1_walk_W1_C0' or 'Hero_walk, run_W2_C1'
     """
-    char_name = char.name if char and char.name else "Character_1"
+    char_name = char.name if char and char.name else "Char_1"
 
     if not char:
         return f"{char_name}_ARDY_Stream_W0_C0"
@@ -3373,21 +3373,46 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
         if self.is_regenerating and active_crowd and active_crowd.clear_settings_before_generate:
             bpy.ops.ceb.clear_crowd_settings()
 
-        target_count = props.crowd_count
+        # Collect characters dedicated to this crowd
+        crowd_chars = []
 
-        # Ensure target_count characters exist in props.characters
-        current_count = len(props.characters)
-        if current_count < target_count:
-            for idx in range(current_count + 1, target_count + 1):
-                name = f"Character_{idx}"
+        if self.is_regenerating and active_crowd:
+            # Re-use existing characters assigned to this crowd
+            c_names = [n.strip() for n in active_crowd.character_names.split(",") if n.strip()]
+            for name in c_names:
+                for c in props.characters:
+                    if c.name == name:
+                        crowd_chars.append(c)
+                        break
+
+        if not crowd_chars:
+            target_count = props.crowd_count
+
+            # 1. Include source_char if it is not assigned to any existing crowd
+            if source_char and not get_crowd_for_character(source_char.name, context):
+                crowd_chars.append(source_char)
+
+            # 2. Re-use any existing unassigned characters in props.characters
+            for c in props.characters:
+                if len(crowd_chars) >= target_count:
+                    break
+                if c not in crowd_chars and not get_crowd_for_character(c.name, context):
+                    crowd_chars.append(c)
+
+            # 3. Create brand new characters for the remaining needed count
+            idx_counter = len(props.characters) + 1
+            while len(crowd_chars) < target_count:
+                name = f"Char_{idx_counter}"
                 while any(c.name == name for c in props.characters):
-                    idx += 1
-                    name = f"Character_{idx}"
+                    idx_counter += 1
+                    name = f"Char_{idx_counter}"
                 c = props.characters.add()
                 c.name = name
                 c.model = 'core'
+                crowd_chars.append(c)
+                idx_counter += 1
 
-        num_chars = min(target_count, len(props.characters))
+        num_chars = len(crowd_chars)
 
         # Calculate spatial positions and headings based on selected layout pattern
         positions = []
@@ -3444,12 +3469,14 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
         # Base reference position for Character 0
         x0, y0, z0 = positions[0]
 
-        for i in range(num_chars):
+        for i, char in enumerate(crowd_chars):
             x, y, z = positions[i]
             heading = headings[i]
 
-            props.active_character_index = i
-            char = props.characters[i]
+            for p_idx, c in enumerate(props.characters):
+                if c == char:
+                    props.active_character_index = p_idx
+                    break
 
             clean_prefix = char.name.replace(" ", "_")
             arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
@@ -3502,10 +3529,14 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
             crowd_item.empty_object_name = crowd_empty.name
 
         crowd_char_names = []
-        for i in range(num_chars):
-            char = props.characters[i]
+        crowd_char_indices = []
+        for i, char in enumerate(crowd_chars):
             crowd_char_names.append(char.name)
             parent_character_items_to_crowd(char, crowd_empty)
+            for p_idx, c in enumerate(props.characters):
+                if c == char:
+                    crowd_char_indices.append(p_idx)
+                    break
 
         crowd_item.character_names = ",".join(crowd_char_names)
         crowd_item.crowd_count = num_chars
@@ -3523,7 +3554,7 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
 
         # Determine simulation character sequence order
         reverse_order = getattr(props, "crowd_reverse_order", False)
-        char_indices = list(reversed(range(num_chars))) if reverse_order else list(range(num_chars))
+        char_indices = list(reversed(crowd_char_indices)) if reverse_order else list(crowd_char_indices)
         first_idx = char_indices[0]
 
         props.active_character_index = first_idx
@@ -4205,7 +4236,7 @@ class CEB_OT_StartIKControl(bpy.types.Operator):
             arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_name}_Armature"
             orig_arm = bpy.data.objects.get(arm_name)
             if not orig_arm:
-                orig_arm = bpy.data.objects.get("Character_1_Armature") or bpy.data.objects.get(f"{char.name}_Armature")
+                orig_arm = bpy.data.objects.get("Char_1_Armature") or bpy.data.objects.get("Character_1_Armature") or bpy.data.objects.get(f"{char.name}_Armature")
             if not orig_arm:
                 self.report({'ERROR'}, f"Character armature object for '{char.name}' not found.")
                 return {'CANCELLED'}
