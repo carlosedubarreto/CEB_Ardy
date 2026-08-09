@@ -185,66 +185,72 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             c_head.prop(props, "show_crowd_options", text="Crowd Options", icon=c_icon, emboss=False)
 
             if props.show_crowd_options:
-                # --- Crowd Generation ---
-                crowd_box = crowd_main_box.box()
-                crowd_box.enabled = not is_ik_active
-                crowd_box.label(text="Crowd Generation", icon='COMMUNITY')
-                crowd_col = crowd_box.column(align=True)
-                crowd_col.prop(props, "crowd_count", text="Characters Count")
-                
-                layout_row = crowd_col.row(align=True)
-                layout_row.prop(props, "crowd_layout", text="Layout")
-                layout_row.prop(props, "crowd_spacing", text="Spacing (m)")
-                
-                crowd_col.prop(props, "crowd_offset_waypoints", text="Parallel Trajectories (Offset Waypoints)")
-                crowd_col.prop(props, "crowd_reverse_order", text="Simulate From Last Character")
-                
-                avoid_row = crowd_col.row(align=True)
+                # --- Crowd Generation (Collapsible) ---
+                crowd_gen_box = crowd_main_box.box()
+                crowd_gen_box.enabled = not is_ik_active
+                cg_head = crowd_gen_box.row(align=True)
+                cg_icon = 'DISCLOSURE_TRI_DOWN' if getattr(props, "show_crowd_generation", True) else 'DISCLOSURE_TRI_RIGHT'
+                cg_head.prop(props, "show_crowd_generation", text="Crowd Generation", icon=cg_icon, emboss=False)
 
-                avoid_row.prop(props, "crowd_avoid_collisions", text="Avoid Collisions")
-                if props.crowd_avoid_collisions:
-                    avoid_row.prop(props, "crowd_avoid_radius", text="Buffer (m)")
-                    crowd_col.prop(props, "crowd_avoid_unsimulated", text="Avoid Standing Locations (Unsimulated)")
+                if getattr(props, "show_crowd_generation", True):
+                    crowd_col = crowd_gen_box.column(align=True)
+                    crowd_col.prop(props, "crowd_count", text="Characters Count")
+                    
+                    layout_row = crowd_col.row(align=True)
+                    layout_row.prop(props, "crowd_layout", text="Layout")
+                    layout_row.prop(props, "crowd_spacing", text="Spacing (m)")
+                    
+                    crowd_col.prop(props, "crowd_offset_waypoints", text="Parallel Trajectories (Offset Waypoints)")
+                    crowd_col.prop(props, "crowd_reverse_order", text="Simulate From Last Character")
+                    
+                    avoid_row = crowd_col.row(align=True)
+                    avoid_row.prop(props, "crowd_avoid_collisions", text="Avoid Collisions")
+                    if props.crowd_avoid_collisions:
+                        avoid_row.prop(props, "crowd_avoid_radius", text="Buffer (m)")
+                        crowd_col.prop(props, "crowd_avoid_unsimulated", text="Avoid Standing Locations (Unsimulated)")
 
-                frame_row = crowd_col.row(align=True)
-                frame_row.prop(props, "crowd_start_frame", text="Start Frame")
-                frame_row.prop(props, "crowd_end_frame", text="End Frame")
-                btn_row = crowd_box.row(align=True)
-                btn_row.scale_y = 1.3
-                btn_row.operator("ceb.generate_crowd_animation", text="Generate Crowd Animation", icon='GROUP')
+                    frame_row = crowd_col.row(align=True)
+                    frame_row.prop(props, "crowd_start_frame", text="Start Frame")
+                    frame_row.prop(props, "crowd_end_frame", text="End Frame")
+                    btn_row = crowd_gen_box.row(align=True)
+                    btn_row.scale_y = 1.3
+                    btn_row.operator("ceb.generate_crowd_animation", text="Generate Crowd Animation", icon='GROUP')
 
-                # --- Crowd Management ---
+                # --- Crowd Management (Collapsible) ---
                 cr_mgmt_box = crowd_main_box.box()
                 cr_mgmt_box.enabled = not is_ik_active
-                cr_mgmt_box.label(text="Crowd Management", icon='COMMUNITY')
+                cm_head = cr_mgmt_box.row(align=True)
+                cm_icon = 'DISCLOSURE_TRI_DOWN' if getattr(props, "show_crowd_management", True) else 'DISCLOSURE_TRI_RIGHT'
+                cm_head.prop(props, "show_crowd_management", text="Crowd Management", icon=cm_icon, emboss=False)
 
-                row = cr_mgmt_box.row()
-                row.enabled = not is_ik_active
-                row.template_list(
-                    "CEB_UL_CrowdList", "",
-                    props, "crowds",
-                    props, "active_crowd_index",
-                    rows=2
-                )
-                col = row.column(align=True)
-                col.enabled = not is_ik_active
+                if getattr(props, "show_crowd_management", True):
+                    row = cr_mgmt_box.row()
+                    row.enabled = not is_ik_active
+                    row.template_list(
+                        "CEB_UL_CrowdList", "",
+                        props, "crowds",
+                        props, "active_crowd_index",
+                        rows=2
+                    )
+                    col = row.column(align=True)
+                    col.enabled = not is_ik_active
 
-                active_crowd = get_active_crowd(context)
-                if active_crowd:
-                    c_details = cr_mgmt_box.box()
-                    c_details.enabled = not is_ik_active
-                    c_details.prop(active_crowd, "name", text="Name")
-                    if active_crowd.empty_object_name:
-                        c_details.label(text=f"Parent Empty: {active_crowd.empty_object_name}", icon='EMPTY_DATA')
+                    active_crowd = get_active_crowd(context)
+                    if active_crowd:
+                        c_details = cr_mgmt_box.box()
+                        c_details.enabled = not is_ik_active
+                        c_details.prop(active_crowd, "name", text="Name")
+                        if active_crowd.empty_object_name:
+                            c_details.label(text=f"Parent Empty: {active_crowd.empty_object_name}", icon='EMPTY_DATA')
 
-                    c_details.prop(active_crowd, "clear_settings_before_generate", text="Clear Settings Before Generate")
+                        c_details.prop(active_crowd, "clear_settings_before_generate", text="Clear Settings Before Generate")
 
-                    c_btns = c_details.row(align=True)
-                    c_btns.scale_y = 1.2
-                    c_btns.operator("ceb.select_crowd", text="Select", icon='RESTRICT_SELECT_OFF')
-                    c_btns.operator("ceb.regenerate_crowd", text="Regenerate", icon='FILE_REFRESH')
-                    c_btns.operator("ceb.clear_crowd_settings", text="Clear Settings", icon='TRASH')
-                    c_btns.operator("ceb.delete_crowd", text="Delete", icon='TRASH')
+                        c_btns = c_details.row(align=True)
+                        c_btns.scale_y = 1.2
+                        c_btns.operator("ceb.select_crowd", text="Select", icon='RESTRICT_SELECT_OFF')
+                        c_btns.operator("ceb.regenerate_crowd", text="Regenerate", icon='FILE_REFRESH')
+                        c_btns.operator("ceb.clear_crowd_settings", text="Clear Settings", icon='TRASH')
+                        c_btns.operator("ceb.delete_crowd", text="Delete", icon='TRASH')
 
         else:
             char_box = box.box()

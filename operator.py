@@ -395,6 +395,13 @@ def remove_waypoint_empty(item):
 def update_has_waypoint(self, context):
     tag_redraw_view3d(context)
     if getattr(self, "has_waypoint", False):
+        if abs(self.waypoint_co[0]) < 1e-5 and abs(self.waypoint_co[1]) < 1e-5 and abs(self.waypoint_co[2]) < 1e-5:
+            char = get_active_character(context)
+            if char:
+                cx, cy, cz, ch = get_character_world_transform(char)
+                fwd_x = -math.sin(ch)
+                fwd_y = math.cos(ch)
+                self.waypoint_co = (cx + fwd_x * 2.0, cy + fwd_y * 2.0, cz)
         get_or_create_waypoint_empty(context, self)
     else:
         remove_waypoint_empty(self)
@@ -515,8 +522,12 @@ def update_waypoint_co(self, context):
     tag_redraw_view3d(context)
     if getattr(self, "has_waypoint", False) and getattr(self, "waypoint_object_name", ""):
         obj = bpy.data.objects.get(self.waypoint_object_name)
-        if obj and (obj.location - mathutils.Vector(self.waypoint_co)).length > 1e-4:
-            obj.location = self.waypoint_co
+        if obj:
+            target_co = mathutils.Vector(self.waypoint_co)
+            if obj.parent:
+                obj.matrix_world.translation = target_co
+            elif (obj.location - target_co).length > 1e-4:
+                obj.location = target_co
     send_waypoints_to_bridge(context)
 
 class CEB_Ardy_PromptItem(bpy.types.PropertyGroup):
@@ -663,6 +674,13 @@ def get_crowd_for_character(char_name, context=None):
 def parent_character_items_to_crowd(char, crowd_empty):
     if not char or not crowd_empty:
         return
+
+    # Ensure view layer dependency graph is updated so crowd_empty.matrix_world is valid
+    if hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
+        bpy.context.view_layer.update()
+    else:
+        crowd_empty.matrix_world = mathutils.Matrix.Translation(crowd_empty.location)
+
     inv_mat = crowd_empty.matrix_world.inverted()
 
     # Parent character armature
@@ -670,21 +688,27 @@ def parent_character_items_to_crowd(char, crowd_empty):
     arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
     arm_obj = bpy.data.objects.get(arm_name)
     if arm_obj and arm_obj.parent != crowd_empty:
+        wmat = arm_obj.matrix_world.copy()
         arm_obj.parent = crowd_empty
         arm_obj.matrix_parent_inverse = inv_mat
+        arm_obj.matrix_world = wmat
 
     # Parent waypoints & pose constraints belonging to this character
     for pitem in char.prompt_schedule:
         if pitem.waypoint_object_name:
             wp_obj = bpy.data.objects.get(pitem.waypoint_object_name)
             if wp_obj and wp_obj.parent != crowd_empty:
+                wmat = wp_obj.matrix_world.copy()
                 wp_obj.parent = crowd_empty
                 wp_obj.matrix_parent_inverse = inv_mat
+                wp_obj.matrix_world = wmat
         if getattr(pitem, "pose_armature_name", ""):
             pc_obj = bpy.data.objects.get(pitem.pose_armature_name)
             if pc_obj and pc_obj.parent != crowd_empty:
+                wmat = pc_obj.matrix_world.copy()
                 pc_obj.parent = crowd_empty
                 pc_obj.matrix_parent_inverse = inv_mat
+                pc_obj.matrix_world = wmat
 
 def update_active_crowd(self, context):
     tag_redraw_view3d(context)
@@ -916,6 +940,16 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     show_crowd_options: bpy.props.BoolProperty(
         name="Show Crowd Options",
         description="Toggle display of crowd options in the panel",
+        default=True
+    )
+    show_crowd_generation: bpy.props.BoolProperty(
+        name="Show Crowd Generation",
+        description="Toggle display of Crowd Generation parameters",
+        default=True
+    )
+    show_crowd_management: bpy.props.BoolProperty(
+        name="Show Crowd Management",
+        description="Toggle display of Crowd Management list and controls",
         default=True
     )
     quantize_4bit: bpy.props.BoolProperty(
@@ -1434,7 +1468,14 @@ def get_or_create_waypoint_empty(context, item):
         
         item.waypoint_object_name = obj.name
 
-    obj.location = item.waypoint_co
+    target_co = mathutils.Vector(item.waypoint_co)
+    if obj.parent:
+        if hasattr(context, "view_layer") and context.view_layer:
+            context.view_layer.update()
+        obj.location = obj.parent.matrix_world.inverted() @ target_co
+        obj.matrix_world.translation = target_co
+    else:
+        obj.location = target_co
     return obj
 
 @persistent
@@ -1447,9 +1488,10 @@ def ardy_depsgraph_sync_waypoints(scene, depsgraph=None):
             if item.has_waypoint and item.waypoint_object_name:
                 obj = bpy.data.objects.get(item.waypoint_object_name)
                 if obj:
+                    world_co = obj.matrix_world.to_translation()
                     loc_vec = mathutils.Vector(item.waypoint_co)
-                    if (obj.location - loc_vec).length > 1e-4:
-                        item.waypoint_co = obj.location
+                    if (world_co - loc_vec).length > 1e-4:
+                        item.waypoint_co = world_co
 
 class CEB_OT_AddWaypoint(bpy.types.Operator):
     bl_idname = "ceb.add_waypoint"
@@ -3044,6 +3086,12 @@ def copy_character_prompt_schedule(source_char, target_char, context, offset_vec
                 new_item.waypoint_co = src_item.waypoint_co
             get_or_create_waypoint_empty(context, new_item)
         new_item.has_pose_constraint = src_item.has_pose_constraint
+
+    crowd = get_crowd_for_character(target_char.name, context)
+    if crowd and crowd.empty_object_name:
+        crowd_empty = bpy.data.objects.get(crowd.empty_object_name)
+        if crowd_empty:
+            parent_character_items_to_crowd(target_char, crowd_empty)
 _recorded_crowd_trajectories = {}
 
 def generate_collision_avoidance_waypoints(char_k, char_idx, start_frame, end_frame, avoid_radius, context):
@@ -3187,6 +3235,11 @@ def generate_collision_avoidance_waypoints(char_k, char_idx, start_frame, end_fr
                     item.has_waypoint = True
                     item.waypoint_co = (detour_co.x, detour_co.y, detour_co.z)
                     get_or_create_waypoint_empty(context, item)
+                    crowd = get_crowd_for_character(char_k.name, context)
+                    if crowd and crowd.empty_object_name:
+                        crowd_empty = bpy.data.objects.get(crowd.empty_object_name)
+                        if crowd_empty:
+                            parent_character_items_to_crowd(char_k, crowd_empty)
                     print(f"[CEB Ardy Collision Avoidance] Inserted detour waypoint for '{char_k.name}' at frame {f} (dist={dist:.2f}m < {avoid_radius:.2f}m, detour={detour_dist:.2f}m)")
                     break
 
