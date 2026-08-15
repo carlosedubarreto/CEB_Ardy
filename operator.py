@@ -253,59 +253,7 @@ def send_pose_constraints_to_bridge(context=None, start_frame=None):
         _realtime_client.sendall(b"CLEAR_POSE_CONSTRAINTS\n")
         import json
 
-        # 1. Send current viewport pose as starting constraint at start_frame
-        has_existing_start_constraint = any(
-            item.enabled and getattr(item, "has_pose_constraint", False) and item.start_frame == start_frame
-            for item in char.prompt_schedule
-        )
 
-        if not has_existing_start_constraint:
-            arm_obj = None
-            if char.arm_obj_name:
-                arm_obj = bpy.data.objects.get(char.arm_obj_name)
-            if not arm_obj:
-                clean_name = char.name.replace(" ", "_")
-                arm_obj = bpy.data.objects.get(f"{clean_name}_Armature")
-
-            if arm_obj and arm_obj.pose:
-                bone_names = [b.name for b in arm_obj.pose.bones]
-                num_bones = len(bone_names)
-                if num_bones == 30:
-                    joint_order = _soma30_names
-                elif num_bones == 24:
-                    joint_order = _smpl24_names
-                elif num_bones == 22:
-                    joint_order = _smpl22_names
-                else:
-                    joint_order = bone_names
-
-                joints_pos = []
-                joints_rot = []
-                for jname in joint_order:
-                    bone = arm_obj.pose.bones.get(jname)
-                    if bone is None:
-                        joints_pos.append([0.0, 0.0, 0.0])
-                        joints_rot.append([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-                        continue
-
-                    # Capture absolute world space transform for ARDY constraints
-                    mat_world = arm_obj.matrix_world @ bone.matrix
-                    head_loc = mat_world.to_translation()
-                    rot_mat = mat_world.to_3x3()
-
-                    pos_a = blender_pos_to_ardy(head_loc, scale=scale)
-                    rot_a = blender_rot_to_ardy(rot_mat)
-
-                    joints_pos.append(pos_a)
-                    joints_rot.append(rot_a)
-
-                pos_json = json.dumps(joints_pos)
-                rot_json = json.dumps(joints_rot)
-                cmd = f"POSE_CONSTRAINT:{start_frame}:{pos_json}:{rot_json}\n"
-                _realtime_client.sendall(cmd.encode("utf-8"))
-                print(f"[CEB Ardy] Sent initial/current viewport pose constraint for frame {start_frame}")
-
-        # 2. Send prompt_schedule pose constraints
         for item in char.prompt_schedule:
             if item.enabled and getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
                 if item.start_frame < start_frame:
