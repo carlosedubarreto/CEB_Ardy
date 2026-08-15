@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CEB Ardy",
     "author": "Carlos Barreto",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 4, 0),
     "location": "3D Viewport > Sidebar (N-panel) > CEB",
     "description": "Integrate NVIDIA ARDY real-time motion generation framework into Blender",
@@ -47,7 +47,12 @@ bl_info = {
 ## - 
 
 ## V1.01 Wip2.1
-## - consertar problem com grnad equantidade de personagens (erro quando testo com 25)
+## OK - consertar problem com grnad equantidade de personagens (erro quando testo com 25)
+
+## V1.02 WIP 1
+## OK - Opcao para gravar direto como NLA strip ou manter na timeline (save_as_nla)
+## OK - Ao reiniciar o stream, continuar a partir da pose e posicao atual do personagem
+
 
 import bpy
 from bpy.props import StringProperty

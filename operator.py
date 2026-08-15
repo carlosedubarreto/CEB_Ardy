@@ -810,7 +810,7 @@ def get_character_world_transform(char):
     if not char:
         return char_x, char_y, char_z, char_heading
 
-    # Ensure view layer dependency graph is updated so matrix_world is accurate
+    # Ensure view layer dependency graph is updated so matrix_world and pose bones are accurate
     try:
         if bpy.context and hasattr(bpy.context, "view_layer") and bpy.context.view_layer:
             bpy.context.view_layer.update()
@@ -822,18 +822,34 @@ def get_character_world_transform(char):
     arm_obj = bpy.data.objects.get(arm_name)
     
     if arm_obj:
-        world_matrix = arm_obj.matrix_world
-        world_loc = world_matrix.to_translation()
-        char_x = world_loc.x
-        char_y = world_loc.y
-        char_z = world_loc.z
-        char_heading = world_matrix.to_euler().z
-        # Fallback to direct location if matrix_world is zero but location is set
-        if abs(char_x) < 1e-5 and abs(char_y) < 1e-5 and (abs(arm_obj.location.x) > 1e-4 or abs(arm_obj.location.y) > 1e-4):
-            char_x = arm_obj.location.x
-            char_y = arm_obj.location.y
-            char_z = arm_obj.location.z
-            char_heading = arm_obj.rotation_euler.z
+        root_bone = None
+        if arm_obj.pose and len(arm_obj.pose.bones) > 0:
+            root_bone = arm_obj.pose.bones.get("Hips")
+            if not root_bone:
+                root_bone = arm_obj.pose.bones[0]
+
+        if root_bone:
+            # Capture actual animated root bone world location and orientation
+            root_mat_world = arm_obj.matrix_world @ root_bone.matrix
+            root_loc = root_mat_world.to_translation()
+            char_x = root_loc.x
+            char_y = root_loc.y
+            char_z = root_loc.z
+            rot_euler = root_mat_world.to_euler('XYZ')
+            char_heading = rot_euler.z
+        else:
+            world_matrix = arm_obj.matrix_world
+            world_loc = world_matrix.to_translation()
+            char_x = world_loc.x
+            char_y = world_loc.y
+            char_z = world_loc.z
+            char_heading = world_matrix.to_euler().z
+            # Fallback to direct location if matrix_world is zero but location is set
+            if abs(char_x) < 1e-5 and abs(char_y) < 1e-5 and (abs(arm_obj.location.x) > 1e-4 or abs(arm_obj.location.y) > 1e-4):
+                char_x = arm_obj.location.x
+                char_y = arm_obj.location.y
+                char_z = arm_obj.location.z
+                char_heading = arm_obj.rotation_euler.z
     else:
         parent_name = char.parent_obj_name if char.parent_obj_name else f"ARDY_Character_{clean_name}"
         parent_obj = bpy.data.objects.get(parent_name)
@@ -940,7 +956,7 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     show_crowd_options: bpy.props.BoolProperty(
         name="Show Crowd Options",
         description="Toggle display of crowd options in the panel",
-        default=True
+        default=False
     )
     show_crowd_generation: bpy.props.BoolProperty(
         name="Show Crowd Generation",
@@ -967,6 +983,11 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         name="Live Record",
         description="Record the incoming real-time motion stream as keyframes",
         default=True
+    )
+    save_as_nla: bpy.props.BoolProperty(
+        name="Save as NLA Track",
+        description="Automatically save generated and retargeted animations as NLA tracks (if disabled, keep animation as active Action on the timeline)",
+        default=False
     )
     mute_previous_nla_layers: bpy.props.BoolProperty(
         name="Mute Previous NLA Layers",
@@ -2840,8 +2861,12 @@ def prepare_armature_for_streaming(arm_obj, char, context=None):
     """
     Prepares character armature object for a new streaming session:
     1. Mutes all other NLA layers (tracks) on the character if option is enabled.
-    2. Removes / pushes down any active action strip from the current layer.
-    3. Creates a new Action named with prompts, waypoints, and constraints count, and sets fake user.
+    2. If save_as_nla is enabled:
+       - Pushes any existing active action to an NLA track.
+       - Creates a new Action for the new stream session.
+    3. If save_as_nla is disabled:
+       - If anim_data.action exists, re-uses it (keeping animation on timeline).
+       - If no active action exists, creates a new Action on the timeline.
     """
     if not arm_obj:
         return None
@@ -2854,32 +2879,44 @@ def prepare_armature_for_streaming(arm_obj, char, context=None):
     if context is None:
         context = bpy.context
     props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
-    should_mute = props.mute_previous_nla_layers if props and hasattr(props, "mute_previous_nla_layers") else True
+    should_mute = props.mute_previous_nla_layers if props and hasattr(props, "mute_previous_nla_layers") else False
+    save_nla = props.save_as_nla if props and hasattr(props, "save_as_nla") else True
 
     # 1. Mute all existing NLA layers (tracks) on the character armature if option is enabled
     if should_mute:
         for track in anim_data.nla_tracks:
             track.mute = True
 
-    # 2. Remove active action strip from main action slot if any (push down first if it has keyframes)
-    if anim_data.action:
-        old_act = anim_data.action
-        if action_has_curves(old_act):
-            push_action_to_nla_track(arm_obj, old_act)
-        anim_data.action = None
+    # 2. Handle Action management based on save_as_nla
+    if save_nla:
+        # NLA mode: Push existing active action to NLA track if it has curves
+        if anim_data.action:
+            old_act = anim_data.action
+            old_act.use_fake_user = True
+            if action_has_curves(old_act):
+                push_action_to_nla_track(arm_obj, old_act)
+            anim_data.action = None
 
-    if arm_obj.pose:
-        for b in arm_obj.pose.bones:
-            b.location = mathutils.Vector((0.0, 0.0, 0.0))
-
-    # 3. Create a new NLA action for this stream session
-
-    act_name = get_stream_action_name(char)
-    new_act = bpy.data.actions.new(name=act_name)
-    new_act.use_fake_user = True
-    anim_data.action = new_act
-    print(f"[CEB Ardy] Prepared new NLA action '{new_act.name}' (fake_user=True, mute_previous={should_mute}) for character '{char.name if char else 'Armature'}'")
-    return new_act
+        # Create a new Action for this NLA session
+        act_name = get_stream_action_name(char)
+        new_act = bpy.data.actions.new(name=act_name)
+        new_act.use_fake_user = True
+        anim_data.action = new_act
+        print(f"[CEB Ardy] Prepared new NLA action '{new_act.name}' (fake_user=True, mute_previous={should_mute}) for character '{char.name if char else 'Armature'}'")
+        return new_act
+    else:
+        # Timeline mode: Keep active action or create one if none exists
+        if not anim_data.action:
+            act_name = get_stream_action_name(char)
+            new_act = bpy.data.actions.new(name=act_name)
+            new_act.use_fake_user = True
+            anim_data.action = new_act
+            print(f"[CEB Ardy] Prepared new timeline action '{new_act.name}' for character '{char.name if char else 'Armature'}'")
+            return new_act
+        else:
+            anim_data.action.use_fake_user = True
+            print(f"[CEB Ardy] Continuing on existing timeline action '{anim_data.action.name}' for character '{char.name if char else 'Armature'}'")
+            return anim_data.action
 
 
 MHR_TO_ARDY_BONE_MAP = {
@@ -3048,16 +3085,23 @@ def retarget_animation_to_ardy(tgt_arm_obj, src_arm_obj, context=None):
             tgt_pbone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
             context.view_layer.update()
 
-    # Push to NLA Track
-    push_action_to_nla_track(tgt_arm_obj, target_act)
-    tgt_arm_obj.animation_data.action = None
+    # Push to NLA Track if enabled, otherwise keep as active Action on the timeline
+    save_nla = props.save_as_nla if props and hasattr(props, "save_as_nla") else True
+    target_act.use_fake_user = True
+
+    if save_nla:
+        push_action_to_nla_track(tgt_arm_obj, target_act)
+        tgt_arm_obj.animation_data.action = None
+        print(f"[CEB Ardy] Successfully retargeted animation '{src_arm_obj.name}' to '{tgt_arm_obj.name}' ({frame_start}..{frame_end}) as NLA track '{target_act.name}'")
+    else:
+        tgt_arm_obj.animation_data.action = target_act
+        print(f"[CEB Ardy] Successfully retargeted animation '{src_arm_obj.name}' to '{tgt_arm_obj.name}' ({frame_start}..{frame_end}) as Timeline Action '{target_act.name}'")
 
     context.scene.frame_start = frame_start
     context.scene.frame_end = frame_end
     context.scene.frame_set(frame_start)
     tag_redraw_view3d(context)
 
-    print(f"[CEB Ardy] Successfully retargeted animation '{src_arm_obj.name}' to '{tgt_arm_obj.name}' ({frame_start}..{frame_end}) as NLA track '{target_act.name}'")
     return target_act
 
 
@@ -3119,7 +3163,9 @@ class CEB_OT_RetargetMHR(bpy.types.Operator):
             self.report({'ERROR'}, "Failed to retarget animation.")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Successfully retargeted '{src_arm_obj.name}' to '{char.name}' as NLA action '{act.name}'.")
+        save_nla = props.save_as_nla if props and hasattr(props, "save_as_nla") else True
+        dest_type = "NLA action" if save_nla else "Timeline action"
+        self.report({'INFO'}, f"Successfully retargeted '{src_arm_obj.name}' to '{char.name}' as {dest_type} '{act.name}'.")
         return {'FINISHED'}
 
 
@@ -3872,9 +3918,15 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             arm_obj = bpy.data.objects.get(arm_name)
             if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action:
                 act = arm_obj.animation_data.action
+                act.use_fake_user = True
+                save_nla = props.save_as_nla if props and hasattr(props, "save_as_nla") else True
                 if action_has_curves(act):
-                    push_action_to_nla_track(arm_obj, act)
-                arm_obj.animation_data.action = None
+                    if save_nla:
+                        push_action_to_nla_track(arm_obj, act)
+                        arm_obj.animation_data.action = None
+                        print(f"[CEB Ardy] Saved animation '{act.name}' as NLA track.")
+                    else:
+                        print(f"[CEB Ardy] Saved animation '{act.name}' on timeline (active action).")
 
         self._buffer = ""
         self._frame_queue = None
@@ -4011,9 +4063,14 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             if frame_num >= end_f:
                 if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action:
                     act = arm_obj.animation_data.action
+                    act.use_fake_user = True
+                    save_nla = props.save_as_nla if props and hasattr(props, "save_as_nla") else True
                     if action_has_curves(act):
-                        push_action_to_nla_track(arm_obj, act)
-                    arm_obj.animation_data.action = None
+                        if save_nla:
+                            push_action_to_nla_track(arm_obj, act)
+                            arm_obj.animation_data.action = None
+                        else:
+                            print(f"[CEB Ardy] Saved crowd character animation '{act.name}' on timeline (active action).")
 
                 self._crowd_current_char_idx += 1
                 if self._crowd_current_char_idx < len(self._crowd_char_indices):
