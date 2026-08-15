@@ -3632,10 +3632,6 @@ class CEB_OT_GenerateCrowdAnimation(bpy.types.Operator):
                     if c.name == char.name:
                         crowd_char_indices.append(p_idx)
                         break
-            for p_idx, c in enumerate(props.characters):
-                if c == char:
-                    crowd_char_indices.append(p_idx)
-                    break
 
         crowd_item.character_names = ",".join(crowd_char_names)
         crowd_item.crowd_count = num_chars
