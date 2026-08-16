@@ -29,10 +29,9 @@ def tag_redraw_view3d(self=None, context=None):
             context = bpy.context
     if hasattr(context, "window_manager") and context.window_manager:
         for window in context.window_manager.windows:
-            if hasattr(window, "screen") and window.screen:
-                for area in window.screen.areas:
-                    if area.type in {'VIEW_3D', 'DOPESHEET_EDITOR', 'TIMELINE', 'GRAPH_EDITOR', 'NLA_EDITOR'}:
-                        area.tag_redraw()
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
 
 def send_waypoints_to_bridge(context=None, start_frame=None):
     global _realtime_client, _realtime_running, _active_stream_operator
@@ -254,7 +253,59 @@ def send_pose_constraints_to_bridge(context=None, start_frame=None):
         _realtime_client.sendall(b"CLEAR_POSE_CONSTRAINTS\n")
         import json
 
+        # 1. Send current viewport pose as starting constraint at start_frame
+        has_existing_start_constraint = any(
+            item.enabled and getattr(item, "has_pose_constraint", False) and item.start_frame == start_frame
+            for item in char.prompt_schedule
+        )
 
+        if not has_existing_start_constraint:
+            arm_obj = None
+            if char.arm_obj_name:
+                arm_obj = bpy.data.objects.get(char.arm_obj_name)
+            if not arm_obj:
+                clean_name = char.name.replace(" ", "_")
+                arm_obj = bpy.data.objects.get(f"{clean_name}_Armature")
+
+            if arm_obj and arm_obj.pose:
+                bone_names = [b.name for b in arm_obj.pose.bones]
+                num_bones = len(bone_names)
+                if num_bones == 30:
+                    joint_order = _soma30_names
+                elif num_bones == 24:
+                    joint_order = _smpl24_names
+                elif num_bones == 22:
+                    joint_order = _smpl22_names
+                else:
+                    joint_order = bone_names
+
+                joints_pos = []
+                joints_rot = []
+                for jname in joint_order:
+                    bone = arm_obj.pose.bones.get(jname)
+                    if bone is None:
+                        joints_pos.append([0.0, 0.0, 0.0])
+                        joints_rot.append([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+                        continue
+
+                    # Capture absolute world space transform for ARDY constraints
+                    mat_world = arm_obj.matrix_world @ bone.matrix
+                    head_loc = mat_world.to_translation()
+                    rot_mat = mat_world.to_3x3()
+
+                    pos_a = blender_pos_to_ardy(head_loc, scale=scale)
+                    rot_a = blender_rot_to_ardy(rot_mat)
+
+                    joints_pos.append(pos_a)
+                    joints_rot.append(rot_a)
+
+                pos_json = json.dumps(joints_pos)
+                rot_json = json.dumps(joints_rot)
+                cmd = f"POSE_CONSTRAINT:{start_frame}:{pos_json}:{rot_json}\n"
+                _realtime_client.sendall(cmd.encode("utf-8"))
+                print(f"[CEB Ardy] Sent initial/current viewport pose constraint for frame {start_frame}")
+
+        # 2. Send prompt_schedule pose constraints
         for item in char.prompt_schedule:
             if item.enabled and getattr(item, "has_pose_constraint", False) and getattr(item, "pose_armature_name", ""):
                 if item.start_frame < start_frame:
@@ -889,7 +940,7 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
     show_crowd_options: bpy.props.BoolProperty(
         name="Show Crowd Options",
         description="Toggle display of crowd options in the panel",
-        default=True
+        default=False
     )
     show_crowd_generation: bpy.props.BoolProperty(
         name="Show Crowd Generation",
@@ -2785,9 +2836,6 @@ def push_action_to_nla_track(arm_obj, action):
         return None
 
 
-
-
-
 def prepare_armature_for_streaming(arm_obj, char, context=None):
     """
     Prepares character armature object for a new streaming session:
@@ -2798,32 +2846,20 @@ def prepare_armature_for_streaming(arm_obj, char, context=None):
     if not arm_obj:
         return None
 
-    if context is None:
-        context = bpy.context
-
-    # Ensure arm_obj is active and in POSE mode so that keyframe_insert properly initializes ActionSlots in Blender 4.4/4.5+
-    if context and hasattr(context, "view_layer") and context.view_layer:
-        try:
-            if context.view_layer.objects.active != arm_obj:
-                context.view_layer.objects.active = arm_obj
-            arm_obj.select_set(True)
-            if arm_obj.mode != 'POSE':
-                bpy.ops.object.mode_set(mode='POSE')
-        except Exception:
-            pass
-
     if not arm_obj.animation_data:
         arm_obj.animation_data_create()
 
     anim_data = arm_obj.animation_data
 
+    if context is None:
+        context = bpy.context
     props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
     should_mute = props.mute_previous_nla_layers if props and hasattr(props, "mute_previous_nla_layers") else True
 
-    if save_nla:
-        if should_mute:
-            for track in anim_data.nla_tracks:
-                track.mute = True
+    # 1. Mute all existing NLA layers (tracks) on the character armature if option is enabled
+    if should_mute:
+        for track in anim_data.nla_tracks:
+            track.mute = True
 
     # 2. Remove active action strip from main action slot if any (push down first if it has keyframes)
     if anim_data.action:
@@ -2950,31 +2986,13 @@ def retarget_animation_to_ardy(tgt_arm_obj, src_arm_obj, context=None):
     char_name = char.name if char else tgt_arm_obj.name.replace("_Armature", "")
     act_name = f"{char_name}_Retarget"
 
-    # Ensure target armature is active and in POSE mode so action slot is correctly initialized
-    if context and hasattr(context, "view_layer") and context.view_layer:
-        try:
-            if context.view_layer.objects.active != tgt_arm_obj:
-                context.view_layer.objects.active = tgt_arm_obj
-            tgt_arm_obj.select_set(True)
-            if tgt_arm_obj.mode != 'POSE':
-                bpy.ops.object.mode_set(mode='POSE')
-        except Exception:
-            pass
-
-    # Create new action and initialize slot for target armature
-    if not tgt_arm_obj.animation_data:
-        tgt_arm_obj.animation_data_create()
-
+    # Create new action for target armature
     target_act = bpy.data.actions.new(name=act_name)
     target_act.use_fake_user = True
-    tgt_arm_obj.animation_data.action = target_act
 
-    root_bone = tgt_arm_obj.pose.bones.get("Hips") if tgt_arm_obj.pose else None
-    if not root_bone and tgt_arm_obj.pose and len(tgt_arm_obj.pose.bones) > 0:
-        root_bone = tgt_arm_obj.pose.bones[0]
-    if root_bone:
-        root_bone.keyframe_insert(data_path="location", frame=frame_start)
-        root_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame_start)
+    if not tgt_arm_obj.animation_data:
+        tgt_arm_obj.animation_data_create()
+    tgt_arm_obj.animation_data.action = target_act
 
     props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
     flip_180 = props.retarget_flip_180 if props and hasattr(props, "retarget_flip_180") else False
@@ -3806,14 +3824,6 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
                 arm_obj = bpy.data.objects.get(arm_name)
                 if arm_obj:
-                    try:
-                        if context.view_layer.objects.active != arm_obj:
-                            context.view_layer.objects.active = arm_obj
-                        arm_obj.select_set(True)
-                        if arm_obj.mode != 'POSE':
-                            bpy.ops.object.mode_set(mode='POSE')
-                    except Exception as mode_err:
-                        print(f"[CEB Ardy] Could not switch to POSE mode: {mode_err}")
                     prepare_armature_for_streaming(arm_obj, char, context=context)
                     self._prepared_arm_name = arm_obj.name
                 else:
@@ -3865,7 +3875,6 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 if action_has_curves(act):
                     push_action_to_nla_track(arm_obj, act)
                 arm_obj.animation_data.action = None
-
 
         self._buffer = ""
         self._frame_queue = None
@@ -3974,14 +3983,8 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                         joints, global_rot_mats, s77_to_s30, J, scale,
                         record_keys=props.realtime_recording, frame_num=frame_num)
 
-        # Force depsgraph update after pose application / keyframing
-        if context and hasattr(context, "view_layer") and context.view_layer:
-            try:
-                context.view_layer.update()
-            except Exception:
-                pass
-
-        tag_redraw_view3d(context)
+        if props.realtime_recording:
+            context.scene.frame_current += 1
 
         # Record frame trajectory for crowd collision avoidance
         # Use the actual root joint world position (joints[0] is in ARDY space; convert to Blender world space)

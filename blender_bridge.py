@@ -639,6 +639,7 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                                 if hasattr(generator, "restart_from_now") and session.motion_tensor is not None and session.frame_idx > 0:
                                                     generator.restart_from_now(generator._client_id)
                                                 elif session.motion_tensor is not None and session.frame_idx == 0:
+                                                    # reset_generator_session(generator, current_prompt)
                                                     prompt_just_changed = True
                                 except Exception as pce:
                                     print(f"[Bridge] Error processing POSE_CONSTRAINT command: {pce}")
