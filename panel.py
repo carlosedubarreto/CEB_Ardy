@@ -78,6 +78,58 @@ class CEB_UL_CrowdList(bpy.types.UIList):
             layout.alignment = 'CENTER'
             layout.label(text=item.name)
 
+class CEB_UL_ActionList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+
+            from .operator import get_active_character
+            char = get_active_character(context)
+            is_assigned = False
+            arm_obj = None
+            if char:
+                clean_prefix = char.name.replace(" ", "_")
+                arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+                arm_obj = bpy.data.objects.get(arm_name)
+            if not arm_obj and context.active_object and context.active_object.type == 'ARMATURE':
+                arm_obj = context.active_object
+
+            if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action == item:
+                is_assigned = True
+
+            # Left toggle checkbox button
+            check_op = row.operator(
+                "ceb.toggle_action_assignment",
+                text="",
+                icon='CHECKBOX_HLT' if is_assigned else 'CHECKBOX_DEHLT',
+                emboss=False
+            )
+            check_op.action_name = item.name
+
+            # Action name
+            row.prop(item, "name", text="", emboss=False)
+
+            # Frame range
+            if hasattr(item, "frame_range") and item.frame_range:
+                f_start = int(item.frame_range[0])
+                f_end = int(item.frame_range[1])
+                row.label(text=f"({f_start}-{f_end})")
+
+            # Quick assign/unassign toggle button
+            btn_text = "Unassign" if is_assigned else "Assign"
+            btn_icon = 'CANCEL' if is_assigned else 'ACTION'
+            btn_op = row.operator(
+                "ceb.toggle_action_assignment",
+                text=btn_text,
+                icon=btn_icon,
+                depress=is_assigned
+            )
+            btn_op.action_name = item.name
+
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text=item.name)
+
 class CEB_PT_ArdyPanel(bpy.types.Panel):
     bl_label = "CEB ARDY"
     bl_idname = "CEB_PT_ardypanel"
@@ -257,6 +309,47 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
             char_box.enabled = not is_ik_active
             char_box.label(text="Click '+' to add a character", icon='INFO')
 
+        # --- Available Actions ---
+        act_box = layout.box()
+        act_box.enabled = is_path_set and (not is_ik_active)
+        act_head = act_box.row(align=True)
+        act_icon = 'DISCLOSURE_TRI_DOWN' if getattr(props, "show_actions_section", True) else 'DISCLOSURE_TRI_RIGHT'
+        act_count = len(bpy.data.actions)
+        act_head.prop(props, "show_actions_section", text=f"Available Actions ({act_count})", icon=act_icon, emboss=False)
+
+        if getattr(props, "show_actions_section", True):
+            if act_count == 0:
+                act_box.label(text="No actions available in blend file", icon='INFO')
+            else:
+                row = act_box.row()
+                row.template_list(
+                    "CEB_UL_ActionList", "",
+                    bpy.data, "actions",
+                    props, "active_action_index",
+                    rows=3
+                )
+                col = row.column(align=True)
+                col.operator("ceb.unassign_character_action", text="", icon='X')
+
+                # Active action indicator for selected character
+                cur_act_name = None
+                arm_obj = None
+                if char:
+                    clean_prefix = char.name.replace(" ", "_")
+                    arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+                    arm_obj = bpy.data.objects.get(arm_name)
+                if not arm_obj and context.active_object and context.active_object.type == 'ARMATURE':
+                    arm_obj = context.active_object
+
+                if arm_obj and arm_obj.animation_data and arm_obj.animation_data.action:
+                    cur_act_name = arm_obj.animation_data.action.name
+
+                if cur_act_name:
+                    char_label = char.name if char else arm_obj.name
+                    status_row = act_box.row(align=True)
+                    status_row.label(text=f"Active: {cur_act_name} ({char_label})", icon='ACTION')
+                    status_row.operator("ceb.unassign_character_action", text="Unassign", icon='CANCEL')
+
         # --- Real-Time Control ---
         box = layout.box()
         box.enabled = is_path_set and (not is_ik_active)
@@ -368,6 +461,7 @@ classes = (
     CEB_UL_CharacterList,
     CEB_UL_PromptList,
     CEB_UL_CrowdList,
+    CEB_UL_ActionList,
     CEB_PT_ArdyPanel,
 )
 

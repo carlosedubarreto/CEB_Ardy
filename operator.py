@@ -952,6 +952,16 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         description="Toggle display of Crowd Management list and controls",
         default=True
     )
+    active_action_index: bpy.props.IntProperty(
+        name="Active Action Index",
+        description="Index of selected action in the actions list",
+        default=0
+    )
+    show_actions_section: bpy.props.BoolProperty(
+        name="Show Available Actions",
+        description="Toggle display of actions section in the panel",
+        default=True
+    )
     quantize_4bit: bpy.props.BoolProperty(
         name="4-bit Quantization (bitsandbytes)",
         description="Load text encoder in 4-bit precision to save GPU VRAM (~5.5 GB VRAM instead of ~16 GB)",
@@ -4743,6 +4753,109 @@ class CEB_OT_RegenerateCrowd(bpy.types.Operator):
 
         return bpy.ops.ceb.generate_crowd_animation(is_regenerating=True)
 
+class CEB_OT_ToggleActionAssignment(bpy.types.Operator):
+    bl_idname = "ceb.toggle_action_assignment"
+    bl_label = "Toggle Action Assignment"
+    bl_description = "Assign this action to the currently selected character, or unassign if already active"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action_name: bpy.props.StringProperty(
+        name="Action Name",
+        description="Name of the action to assign or unassign",
+        default=""
+    )
+
+    def execute(self, context):
+        if not self.action_name:
+            self.report({'ERROR'}, "No action name specified.")
+            return {'CANCELLED'}
+
+        action = bpy.data.actions.get(self.action_name)
+        if not action:
+            self.report({'ERROR'}, f"Action '{self.action_name}' not found in blend file.")
+            return {'CANCELLED'}
+
+        char = get_active_character(context)
+        arm_obj = None
+
+        if char:
+            clean_prefix = char.name.replace(" ", "_")
+            arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+            arm_obj = bpy.data.objects.get(arm_name)
+
+        if not arm_obj and context.active_object and context.active_object.type == 'ARMATURE':
+            arm_obj = context.active_object
+
+        if not arm_obj:
+            char_label = f" for '{char.name}'" if char else ""
+            self.report({'WARNING'}, f"Character armature{char_label} not found in scene. Please load character first.")
+            return {'CANCELLED'}
+
+        if not arm_obj.animation_data:
+            arm_obj.animation_data_create()
+
+        anim_data = arm_obj.animation_data
+        char_name_display = char.name if char else arm_obj.name
+
+        if anim_data.action == action:
+            anim_data.action = None
+            self.report({'INFO'}, f"Unassigned action '{action.name}' from '{char_name_display}'.")
+        else:
+            anim_data.action = action
+            self.report({'INFO'}, f"Assigned action '{action.name}' to '{char_name_display}'.")
+
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+
+        for area in context.screen.areas:
+            if area.type in {'VIEW_3D', 'DOPESHEET_EDITOR', 'NLA_EDITOR', 'TIMELINE'}:
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
+class CEB_OT_UnassignCharacterAction(bpy.types.Operator):
+    bl_idname = "ceb.unassign_character_action"
+    bl_label = "Unassign Current Action"
+    bl_description = "Unassign active action from the current selected character"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        char = get_active_character(context)
+        arm_obj = None
+
+        if char:
+            clean_prefix = char.name.replace(" ", "_")
+            arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
+            arm_obj = bpy.data.objects.get(arm_name)
+
+        if not arm_obj and context.active_object and context.active_object.type == 'ARMATURE':
+            arm_obj = context.active_object
+
+        if not arm_obj:
+            self.report({'WARNING'}, "No character armature found in scene.")
+            return {'CANCELLED'}
+
+        if arm_obj.animation_data and arm_obj.animation_data.action:
+            old_act_name = arm_obj.animation_data.action.name
+            arm_obj.animation_data.action = None
+            char_name_display = char.name if char else arm_obj.name
+            self.report({'INFO'}, f"Unassigned action '{old_act_name}' from '{char_name_display}'.")
+        else:
+            self.report({'INFO'}, "No action currently assigned.")
+
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+
+        for area in context.screen.areas:
+            if area.type in {'VIEW_3D', 'DOPESHEET_EDITOR', 'NLA_EDITOR', 'TIMELINE'}:
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
 classes = (
     CEB_Ardy_PromptItem,
     CEB_Ardy_Character,
@@ -4782,6 +4895,9 @@ classes = (
     CEB_OT_StartIKControl,
     CEB_OT_BakeIKPose,
     CEB_OT_CancelIKControl,
+
+    CEB_OT_ToggleActionAssignment,
+    CEB_OT_UnassignCharacterAction,
 )
 
 def register():
