@@ -270,11 +270,7 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         row.prop(props, "realtime_port", text="Port")
         
         box.prop(props, "quantize_4bit", text="4-bit Quantization (VRAM Save)")
-        box.prop(props, "save_as_nla", text="Save as NLA Track")
-        
-        mute_row = box.row()
-        mute_row.enabled = props.save_as_nla
-        mute_row.prop(props, "mute_previous_nla_layers", text="Mute Previous NLA Layers")
+        box.prop(props, "mute_previous_nla_layers", text="Mute Previous NLA Layers")
         
         row = box.row(align=True)
         row.operator("ceb.clean_animation", text="Clean Animation", icon='TRASH')

@@ -455,14 +455,13 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                         new_model = parts[2]
                                         new_prompt = parts[3]
                                         blender_frame = int(parts[4])
-                                        base_start_frame = blender_frame
                                         char_x = float(parts[5])
                                         char_y = float(parts[6])
                                         char_z = float(parts[7])
                                         char_heading = float(parts[8])
                                         current_reset_id = int(parts[9]) if len(parts) >= 10 else 0
 
-                                        print(f"[Bridge] SWITCH_CHAR: '{char_name}' (model={new_model}) at Blender pos=({char_x:.2f}, {char_y:.2f}, {char_z:.2f}), heading={char_heading:.2f}, start_frame={blender_frame}, prompt='{new_prompt}', reset_id={current_reset_id}")
+                                        print(f"[Bridge] SWITCH_CHAR: '{char_name}' (model={new_model}) at Blender pos=({char_x:.2f}, {char_y:.2f}, {char_z:.2f}), heading={char_heading:.2f}, prompt='{new_prompt}', reset_id={current_reset_id}")
                                         
                                         current_prompt = new_prompt
                                         frame_num = blender_frame
@@ -568,17 +567,16 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                                 wp_z_ardy = wp_yb - accum_offset_z
                                                 root_pos_ardy = torch.tensor([wp_x_ardy, 0.0, wp_z_ardy], dtype=torch.float32)
                                                 wp_id = f"waypoint_{wp_frame}"
-                                                rel_wp_frame = max(0, wp_frame - base_start_frame) if 'base_start_frame' in locals() else wp_frame
                                                 root_constraint.add_keyframe(
                                                     keyframe_id=wp_id,
-                                                    frame_idx=rel_wp_frame,
+                                                    frame_idx=wp_frame,
                                                     root_pos=root_pos_ardy,
                                                     viz_label=False,
                                                     exists_ok=True,
                                                     update_path=False,
                                                     add_annulus=False
                                                 )
-                                                print(f"[Bridge] Received 2D Root Waypoint: Blender frame {wp_frame} (ARDY frame {rel_wp_frame}) at Blender ({wp_xb:.2f}, {wp_yb:.2f}, {wp_zb:.2f}) -> ARDY Model Space ({wp_x_ardy:.2f}, 0.0, {wp_z_ardy:.2f})")
+                                                print(f"[Bridge] Received 2D Root Waypoint: Frame {wp_frame} at Blender ({wp_xb:.2f}, {wp_yb:.2f}, {wp_zb:.2f}) -> ARDY Model Space ({wp_x_ardy:.2f}, 0.0, {wp_z_ardy:.2f})")
 
                                                 if hasattr(generator, "restart_from_now") and session.motion_tensor is not None and session.frame_idx > 0:
                                                     # Generation is running: replan from current position
@@ -591,7 +589,7 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                                 else:
                                                     # motion_tensor is None: fresh session. Waypoint constraint
                                                     # is already stored and will be respected by the first _generate_step.
-                                                    print(f"[Bridge] Waypoint queued for fresh session at frame {rel_wp_frame}")
+                                                    print(f"[Bridge] Waypoint queued for fresh session at frame {wp_frame}")
                                 except Exception as wpe:
                                     print(f"[Bridge] Error processing WAYPOINT command: {wpe}")
                             elif line == "CLEAR_POSE_CONSTRAINTS":
@@ -629,16 +627,14 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                                 pos_np[0, 2] -= accum_offset_z
 
                                                 wp_id = f"pose_{p_frame}"
-                                                rel_p_frame = max(0, p_frame - base_start_frame) if 'base_start_frame' in locals() else p_frame
                                                 fb_constraint.add_keyframe(
                                                     keyframe_id=wp_id,
-                                                    frame_idx=rel_p_frame,
+                                                    frame_idx=p_frame,
                                                     joints_pos=pos_np,
                                                     joints_rot=rot_np,
                                                     viz_label=False,
                                                     exists_ok=True
                                                 )
-                                                print(f"[Bridge] Stored Full-Body Pose Constraint: Blender frame {p_frame} -> ARDY session frame {rel_p_frame}")
 
                                                 if hasattr(generator, "restart_from_now") and session.motion_tensor is not None and session.frame_idx > 0:
                                                     generator.restart_from_now(generator._client_id)
