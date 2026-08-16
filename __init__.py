@@ -52,6 +52,7 @@ bl_info = {
 ## V1.02 WIP 1
 ## OK - Opcao para gravar direto como NLA strip ou manter na timeline (save_as_nla)
 ## OK - Ao reiniciar o stream, continuar a partir da pose e posicao atual do personagem
+## OK - Consertado crash ao gravar na timeline com/sem faixas NLA existentes
 
 
 import bpy

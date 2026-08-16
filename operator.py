@@ -29,9 +29,10 @@ def tag_redraw_view3d(self=None, context=None):
             context = bpy.context
     if hasattr(context, "window_manager") and context.window_manager:
         for window in context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
+            if hasattr(window, "screen") and window.screen:
+                for area in window.screen.areas:
+                    if area.type in {'VIEW_3D', 'DOPESHEET_EDITOR', 'TIMELINE', 'GRAPH_EDITOR', 'NLA_EDITOR'}:
+                        area.tag_redraw()
 
 def send_waypoints_to_bridge(context=None, start_frame=None):
     global _realtime_client, _realtime_running, _active_stream_operator
@@ -2805,39 +2806,48 @@ def push_action_to_nla_track(arm_obj, action):
         return None
 
 
+
+
+
 def prepare_armature_for_streaming(arm_obj, char, context=None):
     """
-    Prepares character armature object for a new streaming session:
-    1. Mutes all other NLA layers (tracks) on the character if option is enabled.
-    2. If save_as_nla is enabled:
-       - Pushes any existing active action to an NLA track.
-       - Creates a new Action for the new stream session.
-    3. If save_as_nla is disabled:
-       - If anim_data.action exists, re-uses it (keeping animation on timeline).
-       - If no active action exists, creates a new Action on the timeline.
+    Prepares character armature object for a new streaming session.
+    Ensures that the armature's anim_data.action is always valid with an initialized ActionSlot
+    before any viewport or Dope Sheet redraw occurs, avoiding Blender 5.2/4.5 access violations.
     """
     if not arm_obj:
         return None
+
+    if context is None:
+        context = bpy.context
+
+    # Ensure arm_obj is active and in POSE mode so that keyframe_insert properly initializes ActionSlots in Blender 4.4/4.5+
+    if context and hasattr(context, "view_layer") and context.view_layer:
+        try:
+            if context.view_layer.objects.active != arm_obj:
+                context.view_layer.objects.active = arm_obj
+            arm_obj.select_set(True)
+            if arm_obj.mode != 'POSE':
+                bpy.ops.object.mode_set(mode='POSE')
+        except Exception:
+            pass
 
     if not arm_obj.animation_data:
         arm_obj.animation_data_create()
 
     anim_data = arm_obj.animation_data
 
-    if context is None:
-        context = bpy.context
     props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
     should_mute = props.mute_previous_nla_layers if props and hasattr(props, "mute_previous_nla_layers") else False
     save_nla = props.save_as_nla if props and hasattr(props, "save_as_nla") else True
+    current_frame = context.scene.frame_current if hasattr(context, "scene") else 1
 
-    # 1. Mute all existing NLA layers (tracks) on the character armature if option is enabled
-    if should_mute:
-        for track in anim_data.nla_tracks:
-            track.mute = True
-
-    # 2. Handle Action management based on save_as_nla
     if save_nla:
-        # NLA mode: Push existing active action to NLA track if it has curves
+        if should_mute:
+            for track in anim_data.nla_tracks:
+                track.mute = True
+
+        # Push existing action to NLA track if it has recorded curves
         if anim_data.action:
             old_act = anim_data.action
             old_act.use_fake_user = True
@@ -2845,26 +2855,78 @@ def prepare_armature_for_streaming(arm_obj, char, context=None):
                 push_action_to_nla_track(arm_obj, old_act)
             anim_data.action = None
 
-        # Create a new Action for this NLA session
+        # Create new action and assign to armature
         act_name = get_stream_action_name(char)
         new_act = bpy.data.actions.new(name=act_name)
         new_act.use_fake_user = True
         anim_data.action = new_act
-        print(f"[CEB Ardy] Prepared new NLA action '{new_act.name}' (fake_user=True, mute_previous={should_mute}) for character '{char.name if char else 'Armature'}'")
+
+        # Initialize slot and channels on the new action for all bones
+        if arm_obj.pose and len(arm_obj.pose.bones) > 0:
+            for b in arm_obj.pose.bones:
+                if b.name == "Hips" or b.parent is None:
+                    b.keyframe_insert(data_path="location", frame=current_frame)
+                b.keyframe_insert(data_path="rotation_quaternion", frame=current_frame)
+
+        # Force depsgraph update so action data and ActionSlots are immediately evaluated
+        if context and hasattr(context, "view_layer") and context.view_layer:
+            try:
+                context.view_layer.update()
+                if hasattr(context, "evaluated_depsgraph_get"):
+                    context.evaluated_depsgraph_get().update()
+            except Exception:
+                pass
+
+        print(f"[CEB Ardy] Prepared new NLA action '{new_act.name}' (mute_previous={should_mute}) for character '{char.name if char else 'Armature'}'")
         return new_act
     else:
-        # Timeline mode: Keep active action or create one if none exists
+        # Timeline mode: Keep active action or create a new one if character doesn't have an action
         if not anim_data.action:
             act_name = get_stream_action_name(char)
             new_act = bpy.data.actions.new(name=act_name)
             new_act.use_fake_user = True
             anim_data.action = new_act
-            print(f"[CEB Ardy] Prepared new timeline action '{new_act.name}' for character '{char.name if char else 'Armature'}'")
+
+            # Initialize slot and channels on the new action for all bones
+            if arm_obj.pose and len(arm_obj.pose.bones) > 0:
+                for b in arm_obj.pose.bones:
+                    if b.name == "Hips" or b.parent is None:
+                        b.keyframe_insert(data_path="location", frame=current_frame)
+                    b.keyframe_insert(data_path="rotation_quaternion", frame=current_frame)
+
+            # Force depsgraph update so action data and ActionSlots are immediately evaluated
+            if context and hasattr(context, "view_layer") and context.view_layer:
+                try:
+                    context.view_layer.update()
+                    if hasattr(context, "evaluated_depsgraph_get"):
+                        context.evaluated_depsgraph_get().update()
+                except Exception:
+                    pass
+
+            print(f"[CEB Ardy] Created new timeline action '{new_act.name}' for character '{char.name if char else 'Armature'}'")
             return new_act
         else:
-            anim_data.action.use_fake_user = True
-            print(f"[CEB Ardy] Continuing on existing timeline action '{anim_data.action.name}' for character '{char.name if char else 'Armature'}'")
-            return anim_data.action
+            act = anim_data.action
+            act.use_fake_user = True
+            # Safety check: if existing action has no slots (e.g. created empty in Blender 4.4/4.5), ensure slot is initialized
+            if hasattr(act, "slots") and len(act.slots) == 0:
+                if arm_obj.pose and len(arm_obj.pose.bones) > 0:
+                    for b in arm_obj.pose.bones:
+                        if b.name == "Hips" or b.parent is None:
+                            b.keyframe_insert(data_path="location", frame=current_frame)
+                        b.keyframe_insert(data_path="rotation_quaternion", frame=current_frame)
+
+            # Force depsgraph update so action data and ActionSlots are immediately evaluated
+            if context and hasattr(context, "view_layer") and context.view_layer:
+                try:
+                    context.view_layer.update()
+                    if hasattr(context, "evaluated_depsgraph_get"):
+                        context.evaluated_depsgraph_get().update()
+                except Exception:
+                    pass
+
+            print(f"[CEB Ardy] Continuing on existing timeline action '{act.name}' for character '{char.name if char else 'Armature'}'")
+            return act
 
 
 MHR_TO_ARDY_BONE_MAP = {
@@ -2971,13 +3033,31 @@ def retarget_animation_to_ardy(tgt_arm_obj, src_arm_obj, context=None):
     char_name = char.name if char else tgt_arm_obj.name.replace("_Armature", "")
     act_name = f"{char_name}_Retarget"
 
-    # Create new action for target armature
-    target_act = bpy.data.actions.new(name=act_name)
-    target_act.use_fake_user = True
+    # Ensure target armature is active and in POSE mode so action slot is correctly initialized
+    if context and hasattr(context, "view_layer") and context.view_layer:
+        try:
+            if context.view_layer.objects.active != tgt_arm_obj:
+                context.view_layer.objects.active = tgt_arm_obj
+            tgt_arm_obj.select_set(True)
+            if tgt_arm_obj.mode != 'POSE':
+                bpy.ops.object.mode_set(mode='POSE')
+        except Exception:
+            pass
 
+    # Create new action and initialize slot for target armature
     if not tgt_arm_obj.animation_data:
         tgt_arm_obj.animation_data_create()
+
+    target_act = bpy.data.actions.new(name=act_name)
+    target_act.use_fake_user = True
     tgt_arm_obj.animation_data.action = target_act
+
+    root_bone = tgt_arm_obj.pose.bones.get("Hips") if tgt_arm_obj.pose else None
+    if not root_bone and tgt_arm_obj.pose and len(tgt_arm_obj.pose.bones) > 0:
+        root_bone = tgt_arm_obj.pose.bones[0]
+    if root_bone:
+        root_bone.keyframe_insert(data_path="location", frame=frame_start)
+        root_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame_start)
 
     props = getattr(context.scene, "ceb_ardy", None) if hasattr(context, "scene") else None
     flip_180 = props.retarget_flip_180 if props and hasattr(props, "retarget_flip_180") else False
@@ -3818,6 +3898,14 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                 arm_name = char.arm_obj_name if char.arm_obj_name else f"{clean_prefix}_Armature"
                 arm_obj = bpy.data.objects.get(arm_name)
                 if arm_obj:
+                    try:
+                        if context.view_layer.objects.active != arm_obj:
+                            context.view_layer.objects.active = arm_obj
+                        arm_obj.select_set(True)
+                        if arm_obj.mode != 'POSE':
+                            bpy.ops.object.mode_set(mode='POSE')
+                    except Exception as mode_err:
+                        print(f"[CEB Ardy] Could not switch to POSE mode: {mode_err}")
                     prepare_armature_for_streaming(arm_obj, char, context=context)
                     self._prepared_arm_name = arm_obj.name
                 else:
@@ -3875,6 +3963,13 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                         print(f"[CEB Ardy] Saved animation '{act.name}' as NLA track.")
                     else:
                         print(f"[CEB Ardy] Saved animation '{act.name}' on timeline (active action).")
+
+        # Switch to OBJECT mode on disconnect
+        try:
+            if context.active_object and context.active_object.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception as mode_err:
+            print(f"[CEB Ardy] Could not switch to OBJECT mode on disconnect: {mode_err}")
 
         self._buffer = ""
         self._frame_queue = None
@@ -3983,8 +4078,14 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
                         joints, global_rot_mats, s77_to_s30, J, scale,
                         record_keys=props.realtime_recording, frame_num=frame_num)
 
-        if props.realtime_recording:
-            context.scene.frame_current += 1
+        # Force depsgraph update after pose application / keyframing
+        if context and hasattr(context, "view_layer") and context.view_layer:
+            try:
+                context.view_layer.update()
+            except Exception:
+                pass
+
+        tag_redraw_view3d(context)
 
         # Record frame trajectory for crowd collision avoidance
         # Use the actual root joint world position (joints[0] is in ARDY space; convert to Blender world space)
