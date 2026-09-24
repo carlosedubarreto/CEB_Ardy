@@ -18,8 +18,54 @@ except ImportError:
 _realtime_client = None
 _realtime_running = False
 _active_stream_operator = None
+_bridge_process = None
 _overlay_draw_handler = None
 _3d_draw_handler = None
+
+def check_server_running(port, timeout=0.4):
+    """Check if the ARDY bridge server is actively listening on localhost:port."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(("127.0.0.1", int(port)))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def shutdown_bridge_server(port, timeout=1.0):
+    """Send SHUTDOWN signal to ARDY bridge server and terminate any tracked subprocess."""
+    global _bridge_process
+    
+    # 1. Send SHUTDOWN command over socket if reachable
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(("127.0.0.1", int(port)))
+        s.sendall(b"SHUTDOWN\n")
+        try:
+            s.recv(1024)
+        except Exception:
+            pass
+        s.close()
+    except Exception:
+        pass
+
+    # 2. Terminate subprocess and tree if tracked
+    if _bridge_process is not None:
+        try:
+            pid = _bridge_process.pid
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+            if _bridge_process.poll() is None:
+                _bridge_process.terminate()
+                try:
+                    _bridge_process.wait(timeout=timeout)
+                except Exception:
+                    _bridge_process.kill()
+        except Exception as e:
+            print(f"[CEB Ardy] Error terminating bridge subprocess: {e}")
+        finally:
+            _bridge_process = None
 
 def tag_redraw_view3d(self=None, context=None):
     if context is None:
@@ -997,6 +1043,11 @@ class CEB_Ardy_SceneProperties(bpy.types.PropertyGroup):
         name="180° Facing Correction",
         description="Flip front-to-back rotation orientation by 180° to align facing direction",
         default=True
+    )
+    server_status: bpy.props.StringProperty(
+        name="Server Status",
+        description="Current ARDY bridge server process status",
+        default="Stopped"
     )
     realtime_status: bpy.props.StringProperty(
         name="Real-time Status",
@@ -2721,12 +2772,19 @@ class CEB_OT_LoadArdyCore(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class CEB_OT_ArdyStartBridge(bpy.types.Operator):
-    bl_idname = "ceb.ardy_start_bridge"
-    bl_label = "Start Bridge Process"
-    bl_description = "Start the ARDY real-time bridge process in a new console window for the active character"
+class CEB_OT_ArdyStartServer(bpy.types.Operator):
+    bl_idname = "ceb.ardy_start_server"
+    bl_label = "Start Server"
+    bl_description = "Start the ARDY real-time bridge server process in a separate console window"
 
     def execute(self, context):
+        global _bridge_process
+        props = context.scene.ceb_ardy
+
+        # If a server is already listening, shutdown the existing instance first so a fresh window pops up
+        if check_server_running(props.realtime_port):
+            shutdown_bridge_server(props.realtime_port)
+
         paths, err = get_ardy_paths(context)
         if err:
             self.report({'ERROR'}, err)
@@ -2738,25 +2796,95 @@ class CEB_OT_ArdyStartBridge(bpy.types.Operator):
             self.report({'ERROR'}, f"Could not find bridge script in addon folder: {bridge_script}")
             return {'CANCELLED'}
 
-        props = context.scene.ceb_ardy
         char = get_active_character(context)
         model = char.model if char else 'core'
 
-        cmd = [paths["python_exe"], bridge_script, "--port", str(props.realtime_port), "--model", model, "--ardy-dir", paths["ardy_dir"]]
+        # Use cmd.exe /k with CREATE_NEW_CONSOLE to guarantee a dedicated, visible console window pops up
+        cmd = [
+            "cmd.exe", "/k",
+            paths["python_exe"],
+            bridge_script,
+            "--port", str(props.realtime_port),
+            "--model", model,
+            "--ardy-dir", paths["ardy_dir"]
+        ]
         if props.quantize_4bit:
             cmd.append("--quantize-4bit")
 
         try:
-            subprocess.Popen(
+            _bridge_process = subprocess.Popen(
                 cmd,
                 cwd=paths["ardy_dir"],
                 creationflags=0x00000010  # CREATE_NEW_CONSOLE
             )
-            self.report({'INFO'}, f"Starting ARDY real-time bridge for {char.name if char else 'active character'} (Model: {model.upper()}, Port: {props.realtime_port})...")
+            props.server_status = "Running"
+            self.report({'INFO'}, f"Starting ARDY server console on port {props.realtime_port} (Model: {model.upper()})...")
+
+            # Asynchronously confirm that the socket is accepting connections
+            def _verify_server_listening():
+                if check_server_running(props.realtime_port):
+                    props.server_status = "Running"
+                return None
+            bpy.app.timers.register(_verify_server_listening, first_interval=1.5)
+
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to start bridge process: {e}")
+            props.server_status = "Stopped"
+            self.report({'ERROR'}, f"Failed to start server process: {e}")
             return {'CANCELLED'}
 
+        return {'FINISHED'}
+
+
+class CEB_OT_ArdyStartBridge(bpy.types.Operator):
+    bl_idname = "ceb.ardy_start_bridge"
+    bl_label = "Start Bridge Process"
+    bl_description = "Start the ARDY real-time bridge process in a new console window for the active character"
+
+    def execute(self, context):
+        return bpy.ops.ceb.ardy_start_server()
+
+
+class CEB_OT_ArdyUpdateServerStatus(bpy.types.Operator):
+    bl_idname = "ceb.ardy_update_server_status"
+    bl_label = "Update Status"
+    bl_description = "Check and update the ARDY server connection status"
+
+    def execute(self, context):
+        props = context.scene.ceb_ardy
+        is_running = check_server_running(props.realtime_port)
+        if is_running:
+            props.server_status = "Running"
+            self.report({'INFO'}, f"Server Status: Running (Port {props.realtime_port})")
+        else:
+            props.server_status = "Stopped"
+            if props.realtime_status == "Connected":
+                props.realtime_status = "Disconnected"
+            self.report({'WARNING'}, f"Server Status: Stopped (Port {props.realtime_port} unreachable)")
+        return {'FINISHED'}
+
+
+class CEB_OT_ArdyCloseServer(bpy.types.Operator):
+    bl_idname = "ceb.ardy_close_server"
+    bl_label = "Close Server"
+    bl_description = "Shutdown and close the ARDY real-time bridge server process"
+
+    def execute(self, context):
+        global _realtime_running, _active_stream_operator
+        props = context.scene.ceb_ardy
+
+        # 1. Disconnect active streaming session if running
+        if _realtime_running and _active_stream_operator is not None:
+            try:
+                _active_stream_operator.cleanup(context)
+            except Exception as ce:
+                print(f"[CEB Ardy] Error cleaning up active stream on server shutdown: {ce}")
+
+        # 2. Command server to shut down and terminate process
+        shutdown_bridge_server(props.realtime_port)
+
+        props.server_status = "Stopped"
+        props.realtime_status = "Disconnected"
+        self.report({'INFO'}, f"ARDY bridge server on port {props.realtime_port} has been closed.")
         return {'FINISHED'}
 
 def get_stream_action_name(char):
@@ -3808,6 +3936,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             _realtime_running = True
             _active_stream_operator = self
             props.realtime_status = "Connected"
+            props.server_status = "Running"
             
             self._is_crowd_generating = getattr(CEB_OT_ArdyRealtimeStream, "_is_crowd_generating", False)
             self._crowd_char_indices = getattr(CEB_OT_ArdyRealtimeStream, "_crowd_char_indices", [])
@@ -3853,6 +3982,7 @@ class CEB_OT_ArdyRealtimeStream(bpy.types.Operator):
             self._frame_queue = None
             self._prepared_arm_name = None
             props.realtime_status = "Disconnected"
+            props.server_status = "Stopped"
             return {'CANCELLED'}
 
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
@@ -4887,7 +5017,10 @@ classes = (
     CEB_OT_ArdyRunDemo,
     CEB_OT_ArdyImportNPZ,
     CEB_OT_CleanAnimation,
+    CEB_OT_ArdyStartServer,
     CEB_OT_ArdyStartBridge,
+    CEB_OT_ArdyUpdateServerStatus,
+    CEB_OT_ArdyCloseServer,
     CEB_OT_ArdyRealtimeStream,
     CEB_OT_GenerateCrowdAnimation,
     CEB_OT_RetargetMHR,

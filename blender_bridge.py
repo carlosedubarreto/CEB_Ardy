@@ -414,8 +414,9 @@ def run_server(port, model_name="core", quantize_4bit=False):
     accum_offset_z = 0.0
     last_sent_root = None
     prompt_just_changed = False
+    server_shutdown = False
 
-    while True:
+    while not server_shutdown:
         print("[Bridge Server] Waiting for Blender connection...")
         try:
             client, addr = server.accept()
@@ -679,6 +680,21 @@ def run_server(port, model_name="core", quantize_4bit=False):
                                 prompt_just_changed = False
                                 frame_num = 1
                                 reset_generator_session(generator, current_prompt)
+                            elif line in ("SHUTDOWN", "QUIT", "CLOSE", "EXIT"):
+                                print(f"[Bridge Server] {line} command received from Blender. Shutting down server...")
+                                try:
+                                    client.sendall(b"SHUTDOWN_ACK\n")
+                                except Exception:
+                                    pass
+                                running = False
+                                server_shutdown = True
+                                break
+                            elif line == "PING":
+                                try:
+                                    client.sendall(b"PONG\n")
+                                except Exception:
+                                    pass
+                                continue
                             elif line == "STOP":
                                 print("[Bridge] STOP received.")
                                 running = False
@@ -758,6 +774,15 @@ def run_server(port, model_name="core", quantize_4bit=False):
 
         client.close()
         print("[Bridge Server] Session ended.")
+        if server_shutdown:
+            break
+
+    try:
+        server.close()
+    except Exception:
+        pass
+    print("[Bridge Server] Server process exiting cleanly.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

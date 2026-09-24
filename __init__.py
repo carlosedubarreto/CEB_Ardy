@@ -49,6 +49,10 @@ bl_info = {
 ## V1.01 Wip2.1
 ## - consertar problem com grnad equantidade de personagens (erro quando testo com 25)
 
+## V1.01 WIP3
+## - Adicionar lista de acoes geradas, onde, ao clicar nela, se torna a acao ativa
+## - Opção de rodar streaming de onde o personagem estava, ou iniciar da origem 
+
 import bpy
 from bpy.props import StringProperty
 

@@ -355,31 +355,36 @@ class CEB_PT_ArdyPanel(bpy.types.Panel):
         box.enabled = is_path_set and (not is_ik_active)
         box.label(text="Real-Time Control", icon='ORIENTATION_PARENT')
         
+        is_server_running = (getattr(props, "server_status", "Stopped") == "Running")
         is_connected = (props.realtime_status == "Connected")
-        status_icon = 'CHECKMARK' if is_connected else 'ERROR'
         
-        row = box.row()
-        row.label(text=f"Status: {props.realtime_status}", icon=status_icon)
+        # Server Status and Port
+        row = box.row(align=True)
+        server_status_icon = 'CHECKMARK' if is_server_running else 'DOT'
+        row.label(text=f"Server: {props.server_status}", icon=server_status_icon)
         row.prop(props, "realtime_port", text="Port")
         
+        # Server Operations: Start Server, Update Status, Close Server
+        s_row = box.row(align=True)
+        s_row.scale_y = 1.2
+        s_row.operator("ceb.ardy_start_server", text="Start Server", icon='PLAY')
+        s_row.operator("ceb.ardy_update_server_status", text="Update Status", icon='FILE_REFRESH')
+        s_row.operator("ceb.ardy_close_server", text="Close Server", icon='CANCEL')
+
+        box.separator()
+
         box.prop(props, "quantize_4bit", text="4-bit Quantization (VRAM Save)")
         box.prop(props, "mute_previous_nla_layers", text="Mute Previous NLA Layers")
         
         row = box.row(align=True)
         row.operator("ceb.clean_animation", text="Clean Animation", icon='TRASH')
-        
-        # Bridge Server Controls
-        row = box.row(align=True)
-        row.scale_y = 1.2
-        row.enabled = is_path_set and (not is_ik_active)
-        row.operator("ceb.ardy_start_bridge", text="Start Bridge", icon='PLAY')
 
         # Connect / Disconnect Stream Controls (Fixed position, depress highlight when connected)
         stream_text = "Disconnect Stream" if is_connected else "Connect Stream"
         stream_icon = 'CANCEL' if is_connected else 'LINK_BLEND'
             
         stream_row = box.row(align=True)
-        stream_row.scale_y = 1.5
+        stream_row.scale_y = 1.4
         stream_row.enabled = is_path_set and (not is_ik_active)
         stream_row.operator("ceb.ardy_realtime_stream", text=stream_text, icon=stream_icon, depress=is_connected)
         
